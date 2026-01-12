@@ -17,6 +17,7 @@ import requests
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from config_manager import AppConfig, ConfigManager
+from utils import escape_ffmpeg_path
 
 
 APP_NAME = "Video Translation Studio"
@@ -507,7 +508,8 @@ class WorkerThread(QtCore.QThread):
             f"Outline={settings.border_width},"
             f"Alignment={alignment}"
         )
-        return f"subtitles='{srt_path}':force_style='{style}'"
+        safe_path = escape_ffmpeg_path(str(srt_path))
+        return f"subtitles='{safe_path}':force_style='{style}'"
 
     def _build_blur_filter(self, settings: AppSettings) -> str:
         height_ratio = max(1, min(100, settings.blur_height)) / 100.0
