@@ -117,6 +117,8 @@ def run_subprocess(command: list[str], log_cb=None) -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if process.stdout:
         for line in process.stdout:
@@ -329,12 +331,12 @@ class WorkerThread(QtCore.QThread):
             srt_path = Path(settings.srt_path)
 
         self._step(40, "Translating subtitles")
-        with open(srt_path, "r", encoding="utf-8") as handle:
+        with open(srt_path, "r", encoding="utf-8", errors="replace") as handle:
             entries = parse_srt(handle.read())
 
         translated_entries = self._translate_entries(entries, settings)
         translated_srt = work_dir / "translated.srt"
-        with open(translated_srt, "w", encoding="utf-8") as handle:
+        with open(translated_srt, "w", encoding="utf-8", errors="replace") as handle:
             handle.write(render_srt(translated_entries))
 
         tts_audio = None
