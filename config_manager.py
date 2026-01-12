@@ -10,6 +10,7 @@ class AppConfig:
     openai_api_key: str = ""
     gemini_api_key: str = ""
     custom_tts_key: str = ""
+    custom_tts_url: str = ""
     default_output_dir: str = ""
     default_target_language: str = "en"
     default_provider: str = "ChatGPT"
@@ -42,6 +43,7 @@ class ConfigManager:
             openai_api_key=data.get("openai_api_key", ""),
             gemini_api_key=data.get("gemini_api_key", ""),
             custom_tts_key=data.get("custom_tts_key", ""),
+            custom_tts_url=data.get("custom_tts_url", ""),
             default_output_dir=data.get("default_output_dir", ""),
             default_target_language=data.get("default_target_language", "en"),
             default_provider=data.get("default_provider", "ChatGPT"),
@@ -59,6 +61,7 @@ class ConfigManager:
             "openai_api_key": self.config.openai_api_key,
             "gemini_api_key": self.config.gemini_api_key,
             "custom_tts_key": self.config.custom_tts_key,
+            "custom_tts_url": self.config.custom_tts_url,
             "default_output_dir": self.config.default_output_dir,
             "default_target_language": self.config.default_target_language,
             "default_provider": self.config.default_provider,

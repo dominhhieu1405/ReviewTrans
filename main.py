@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +64,49 @@ def find_tool(tool_name: str) -> Path | None:
             if tool_path.exists():
                 return tool_path
     return None
+
+
+def download_ffmpeg(os_name: str, log_cb=None) -> Path:
+    bin_dir = get_resource_path("bin")
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if os_name == "windows":
+        url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        expected = ["ffmpeg.exe", "ffprobe.exe"]
+    elif os_name == "darwin":
+        url = "https://evermeet.cx/ffmpeg/getrelease/zip"
+        expected = ["ffmpeg", "ffprobe"]
+    else:
+        url = (
+            "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/"
+            "ffmpeg-master-latest-linux64-gpl.zip"
+        )
+        expected = ["ffmpeg", "ffprobe"]
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="ffmpeg_dl_"))
+    archive_path = temp_dir / Path(url).name
+    if log_cb:
+        log_cb(f"Downloading FFmpeg from {url}")
+    with requests.get(url, stream=True, timeout=120) as response:
+        response.raise_for_status()
+        with open(archive_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(temp_dir)
+    for binary in expected:
+        matches = list(temp_dir.rglob(binary))
+        if matches:
+            shutil.copy2(matches[0], bin_dir / binary)
+
+    for binary in expected:
+        target = bin_dir / binary
+        if not target.exists():
+            raise FileNotFoundError(f"Missing {binary} after extraction.")
+        if os_name != "windows":
+            target.chmod(0o755)
+    return bin_dir
 
 
 def run_subprocess(command: list[str], log_cb=None) -> int:
@@ -152,7 +196,6 @@ class AppSettings:
     glossary_instructions: str
     enable_tts: bool
     tts_provider: str
-    custom_api_url: str
     speed: float
     pitch: float
     enable_subtitles: bool
@@ -178,6 +221,27 @@ class ModelFetchThread(QtCore.QThread):
         try:
             models = fetch_whisper_models()
             self.models_ready.emit(models)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class DependencyDownloadThread(QtCore.QThread):
+    status = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+    failed = QtCore.pyqtSignal(str)
+
+    def run(self):
+        try:
+            os_name = platform.system().lower()
+            if os_name.startswith("win"):
+                os_key = "windows"
+            elif os_name.startswith("darwin"):
+                os_key = "darwin"
+            else:
+                os_key = "linux"
+            self.status.emit("Downloading essential components (FFmpeg)...")
+            download_ffmpeg(os_key)
+            self.finished.emit()
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -380,7 +444,7 @@ class WorkerThread(QtCore.QThread):
             thread.start()
             thread.join()
         else:
-            if not self.settings.custom_api_url:
+            if not self.config.custom_tts_url:
                 raise ValueError("Custom API URL is required.")
             payload = {
                 "text": text,
@@ -390,7 +454,7 @@ class WorkerThread(QtCore.QThread):
             if self.config.custom_tts_key:
                 headers["Authorization"] = self.config.custom_tts_key
             response = requests.post(
-                self.settings.custom_api_url,
+                self.config.custom_tts_url,
                 data=payload,
                 headers=headers,
                 timeout=60,
@@ -457,7 +521,11 @@ class SettingsDialog(QtWidgets.QDialog):
         self.config_manager = config_manager
         self.config = config_manager.config
 
-        layout = QtWidgets.QFormLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
+        tabs = QtWidgets.QTabWidget()
+
+        general_tab = QtWidgets.QWidget()
+        general_layout = QtWidgets.QFormLayout(general_tab)
         self.openai_key_edit = QtWidgets.QLineEdit(self.config.openai_api_key)
         self.openai_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.gemini_key_edit = QtWidgets.QLineEdit(self.config.gemini_api_key)
@@ -471,10 +539,20 @@ class SettingsDialog(QtWidgets.QDialog):
         output_layout.addWidget(self.output_dir_edit)
         output_layout.addWidget(output_button)
 
-        layout.addRow("OpenAI API Key:", self.openai_key_edit)
-        layout.addRow("Gemini API Key:", self.gemini_key_edit)
-        layout.addRow("Custom TTS Key:", self.custom_tts_key_edit)
-        layout.addRow("Default Output Folder:", output_layout)
+        general_layout.addRow("OpenAI API Key:", self.openai_key_edit)
+        general_layout.addRow("Gemini API Key:", self.gemini_key_edit)
+        general_layout.addRow("Custom TTS Key:", self.custom_tts_key_edit)
+        general_layout.addRow("Default Output Folder:", output_layout)
+
+        tts_tab = QtWidgets.QWidget()
+        tts_layout = QtWidgets.QFormLayout(tts_tab)
+        self.custom_tts_url_edit = QtWidgets.QLineEdit(self.config.custom_tts_url)
+        self.custom_tts_url_edit.setPlaceholderText("https://example.com/tts")
+        tts_layout.addRow("Custom TTS API URL:", self.custom_tts_url_edit)
+
+        tabs.addTab(general_tab, "General")
+        tabs.addTab(tts_tab, "TTS / Dubbing")
+        layout.addWidget(tabs)
 
         button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Save
@@ -482,7 +560,7 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         button_box.accepted.connect(self._save)
         button_box.rejected.connect(self.reject)
-        layout.addRow(button_box)
+        layout.addWidget(button_box)
 
     def _browse_output_dir(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder")
@@ -493,6 +571,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.config.openai_api_key = self.openai_key_edit.text().strip()
         self.config.gemini_api_key = self.gemini_key_edit.text().strip()
         self.config.custom_tts_key = self.custom_tts_key_edit.text().strip()
+        self.config.custom_tts_url = self.custom_tts_url_edit.text().strip()
         self.config.default_output_dir = self.output_dir_edit.text().strip()
         self.config_manager.save()
         self.accept()
@@ -523,7 +602,6 @@ class MainWindow(QtWidgets.QMainWindow):
         column_layout.addWidget(self._build_output_column())
 
         self._update_source_mode()
-        self._update_tts_provider()
         self._update_provider_models()
         self._load_defaults()
         self._fetch_models_async()
@@ -627,27 +705,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tts_enable_checkbox = QtWidgets.QCheckBox("Enable TTS")
         self.tts_provider_combo = QtWidgets.QComboBox()
         self.tts_provider_combo.addItems(["Edge TTS", "Custom API"])
-        self.tts_provider_combo.currentTextChanged.connect(self._update_tts_provider)
-        self.api_url_edit = QtWidgets.QLineEdit()
-        self.api_url_edit.setPlaceholderText("Custom API URL")
-        self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.speed_slider.setMinimum(50)
-        self.speed_slider.setMaximum(200)
-        self.speed_slider.setValue(100)
-        self.pitch_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.pitch_slider.setMinimum(-12)
-        self.pitch_slider.setMaximum(12)
-        self.pitch_slider.setValue(0)
+        self.speed_input = QtWidgets.QDoubleSpinBox()
+        self.speed_input.setRange(0.5, 2.0)
+        self.speed_input.setSingleStep(0.1)
+        self.speed_input.setValue(1.0)
+        self.pitch_input = QtWidgets.QDoubleSpinBox()
+        self.pitch_input.setRange(-12.0, 12.0)
+        self.pitch_input.setSingleStep(0.5)
+        self.pitch_input.setValue(0.0)
 
         tts_layout.addWidget(self.tts_enable_checkbox, 0, 0, 1, 2)
         tts_layout.addWidget(QtWidgets.QLabel("Provider:"), 1, 0)
         tts_layout.addWidget(self.tts_provider_combo, 1, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Custom API URL:"), 2, 0)
-        tts_layout.addWidget(self.api_url_edit, 2, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Speed:"), 3, 0)
-        tts_layout.addWidget(self.speed_slider, 3, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Pitch:"), 4, 0)
-        tts_layout.addWidget(self.pitch_slider, 4, 1)
+        tts_layout.addWidget(QtWidgets.QLabel("Speed:"), 2, 0)
+        tts_layout.addWidget(self.speed_input, 2, 1)
+        tts_layout.addWidget(QtWidgets.QLabel("Pitch:"), 3, 0)
+        tts_layout.addWidget(self.pitch_input, 3, 1)
 
         layout.addWidget(translation_group)
         layout.addWidget(glossary_group)
@@ -662,7 +735,8 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle_group = QtWidgets.QGroupBox("Subtitles")
         subtitle_layout = QtWidgets.QGridLayout(subtitle_group)
         self.subtitle_enable_checkbox = QtWidgets.QCheckBox("Enable Subtitles")
-        self.font_family_edit = QtWidgets.QLineEdit("Arial")
+        self.font_family_combo = QtWidgets.QComboBox()
+        self.font_family_combo.addItems(QtGui.QFontDatabase.families())
         self.font_size_spin = QtWidgets.QSpinBox()
         self.font_size_spin.setRange(8, 72)
         self.font_size_spin.setValue(24)
@@ -677,7 +751,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         subtitle_layout.addWidget(self.subtitle_enable_checkbox, 0, 0, 1, 2)
         subtitle_layout.addWidget(QtWidgets.QLabel("Font Family:"), 1, 0)
-        subtitle_layout.addWidget(self.font_family_edit, 1, 1)
+        subtitle_layout.addWidget(self.font_family_combo, 1, 1)
         subtitle_layout.addWidget(QtWidgets.QLabel("Font Size:"), 2, 0)
         subtitle_layout.addWidget(self.font_size_spin, 2, 1)
         subtitle_layout.addWidget(QtWidgets.QLabel("Text Color:"), 3, 0)
@@ -693,10 +767,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mute_radio = QtWidgets.QRadioButton("Mute Original")
         self.duck_radio = QtWidgets.QRadioButton("Duck Audio")
         self.mute_radio.setChecked(True)
-        self.duck_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.duck_slider.setMinimum(1)
-        self.duck_slider.setMaximum(100)
-        self.duck_slider.setValue(30)
+        self.duck_input = QtWidgets.QSpinBox()
+        self.duck_input.setRange(0, 100)
+        self.duck_input.setValue(30)
         self.blur_checkbox = QtWidgets.QCheckBox("Blur/Fill Bottom")
         self.blur_height_spin = QtWidgets.QSpinBox()
         self.blur_height_spin.setRange(5, 50)
@@ -708,7 +781,7 @@ class MainWindow(QtWidgets.QMainWindow):
         post_layout.addWidget(self.mute_radio, 0, 0)
         post_layout.addWidget(self.duck_radio, 0, 1)
         post_layout.addWidget(QtWidgets.QLabel("Duck Volume:"), 1, 0)
-        post_layout.addWidget(self.duck_slider, 1, 1)
+        post_layout.addWidget(self.duck_input, 1, 1)
         post_layout.addWidget(self.blur_checkbox, 2, 0)
         post_layout.addWidget(QtWidgets.QLabel("Height %:"), 3, 0)
         post_layout.addWidget(self.blur_height_spin, 3, 1)
@@ -742,6 +815,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tts_enable_checkbox.setChecked(self.config.default_enable_tts)
         self.subtitle_enable_checkbox.setChecked(self.config.default_enable_subtitles)
         self.source_lang_combo.setCurrentText(self.config.default_whisper_language)
+        if "Arial" in QtGui.QFontDatabase.families():
+            self.font_family_combo.setCurrentText("Arial")
 
     def _open_settings(self):
         dialog = SettingsDialog(self.config_manager, self)
@@ -780,10 +855,6 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.model_combo_provider.addItems(GEMINI_MODELS)
 
-    def _update_tts_provider(self):
-        use_custom = self.tts_provider_combo.currentText() == "Custom API"
-        self.api_url_edit.setVisible(use_custom)
-
     def _browse_video(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
@@ -813,6 +884,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker and self.worker.isRunning():
             QtWidgets.QMessageBox.warning(self, "Busy", "Processing already running.")
             return
+        if self.tts_provider_combo.currentText() == "Custom API" and not self.config.custom_tts_url:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing Configuration",
+                "Please configure the Custom TTS Endpoint in Settings.",
+            )
+            return
 
         settings = AppSettings(
             video_path=self.video_path_edit.text().strip(),
@@ -827,17 +905,16 @@ class MainWindow(QtWidgets.QMainWindow):
             glossary_instructions=self.glossary_text.toPlainText(),
             enable_tts=self.tts_enable_checkbox.isChecked(),
             tts_provider=self.tts_provider_combo.currentText(),
-            custom_api_url=self.api_url_edit.text().strip(),
-            speed=self.speed_slider.value() / 100.0,
-            pitch=float(self.pitch_slider.value()),
+            speed=self.speed_input.value(),
+            pitch=float(self.pitch_input.value()),
             enable_subtitles=self.subtitle_enable_checkbox.isChecked(),
-            font_family=self.font_family_edit.text().strip(),
+            font_family=self.font_family_combo.currentText().strip(),
             font_size=self.font_size_spin.value(),
             text_color=self.text_color_display.text().strip(),
             border_width=self.border_width_spin.value(),
             position=self.position_combo.currentText(),
             mute_original=self.mute_radio.isChecked(),
-            duck_audio=self.duck_slider.value(),
+            duck_audio=self.duck_input.value(),
             blur_fill=self.blur_checkbox.isChecked(),
             blur_height=self.blur_height_spin.value(),
             blur_mode=self.blur_mode_combo.currentText(),
@@ -864,6 +941,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    if not find_tool("ffmpeg") or not find_tool("ffprobe"):
+        progress = QtWidgets.QProgressDialog(
+            "Downloading essential components (FFmpeg)...",
+            None,
+            0,
+            0,
+        )
+        progress.setWindowTitle("Initializing")
+        progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.show()
+
+        loop = QtCore.QEventLoop()
+        downloader = DependencyDownloadThread()
+
+        def _finish():
+            loop.quit()
+
+        def _fail(message: str):
+            QtWidgets.QMessageBox.critical(
+                None,
+                "Dependency Error",
+                f"Failed to download FFmpeg: {message}",
+            )
+            loop.quit()
+
+        downloader.status.connect(progress.setLabelText)
+        downloader.finished.connect(_finish)
+        downloader.failed.connect(_fail)
+        downloader.start()
+        loop.exec()
+        progress.close()
+        if not find_tool("ffmpeg") or not find_tool("ffprobe"):
+            return
     config_manager = ConfigManager()
     window = MainWindow(config_manager)
     window.show()
