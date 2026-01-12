@@ -17,7 +17,7 @@ import requests
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from config_manager import AppConfig, ConfigManager
-from utils import escape_ffmpeg_path
+from utils import escape_ffmpeg_path, generate_cache_key
 
 
 APP_NAME = "Video Translation Studio"
@@ -313,6 +313,8 @@ class WorkerThread(QtCore.QThread):
 
         work_dir = Path(tempfile.mkdtemp(prefix="video_trans_"))
         self.log.emit(f"Working directory: {work_dir}")
+        cache_dir = get_resource_path("tmp")
+        cache_dir.mkdir(parents=True, exist_ok=True)
         ffmpeg_path = find_tool("ffmpeg")
         ffprobe_path = find_tool("ffprobe")
         if not ffmpeg_path or not ffprobe_path:
@@ -344,23 +346,36 @@ class WorkerThread(QtCore.QThread):
             whisper_path = find_tool("whisper")
             if not whisper_path:
                 raise FileNotFoundError("whisper executable not found in bin/ or tools/ folder.")
-            models_dir = Path.home() / ".video_translation_studio" / "models"
-            model_path = ensure_whisper_model(settings.whisper_model, models_dir, self.log.emit)
-            srt_path = work_dir / "transcript.srt"
-            whisper_command = [
-                str(whisper_path),
-                "-m",
-                str(model_path),
-                "-f",
-                str(audio_path),
-                "-l",
-                settings.source_language,
-                "-osrt",
-                "-of",
-                str(work_dir / "transcript"),
-            ]
-            if run_subprocess(whisper_command, self.log.emit) != 0:
-                raise RuntimeError("Whisper ASR failed.")
+            video_path = Path(settings.video_path)
+            video_mtime = video_path.stat().st_mtime
+            asr_key = generate_cache_key(video_path, video_mtime, settings.whisper_model)
+            cached_asr = cache_dir / f"asr_{asr_key}.srt"
+            if cached_asr.exists():
+                self.log.emit("Restored ASR from cache.")
+                srt_path = cached_asr
+            else:
+                models_dir = Path.home() / ".video_translation_studio" / "models"
+                model_path = ensure_whisper_model(
+                    settings.whisper_model,
+                    models_dir,
+                    self.log.emit,
+                )
+                srt_path = work_dir / "transcript.srt"
+                whisper_command = [
+                    str(whisper_path),
+                    "-m",
+                    str(model_path),
+                    "-f",
+                    str(audio_path),
+                    "-l",
+                    settings.source_language,
+                    "-osrt",
+                    "-of",
+                    str(work_dir / "transcript"),
+                ]
+                if run_subprocess(whisper_command, self.log.emit) != 0:
+                    raise RuntimeError("Whisper ASR failed.")
+                shutil.copy2(srt_path, cached_asr)
         else:
             if not settings.srt_path:
                 raise ValueError("SRT path is required when using SRT mode.")
@@ -368,19 +383,43 @@ class WorkerThread(QtCore.QThread):
 
         self._step(40, "Translating subtitles")
         with open(srt_path, "r", encoding="utf-8", errors="replace") as handle:
-            entries = parse_srt(handle.read())
+            source_content = handle.read()
+        entries = parse_srt(source_content)
 
-        translated_entries = self._translate_entries(entries, settings)
-        translated_srt = work_dir / "translated.srt"
-        with open(translated_srt, "w", encoding="utf-8", errors="replace") as handle:
-            handle.write(render_srt(translated_entries))
+        trans_key = generate_cache_key(
+            source_content,
+            settings.target_language,
+            settings.provider,
+            settings.provider_model,
+            settings.glossary_instructions,
+        )
+        translated_srt = cache_dir / f"trans_{trans_key}.srt"
+        if translated_srt.exists():
+            self.log.emit("Restored translation from cache.")
+            with open(translated_srt, "r", encoding="utf-8", errors="replace") as handle:
+                translated_entries = parse_srt(handle.read())
+        else:
+            translated_entries = self._translate_entries(entries, settings)
+            with open(translated_srt, "w", encoding="utf-8", errors="replace") as handle:
+                handle.write(render_srt(translated_entries))
 
         tts_audio = None
         if settings.enable_tts:
             self._step(60, "Generating TTS")
-            tts_audio = work_dir / "tts_audio.wav"
-            self._generate_tts(translated_entries, tts_audio, ffmpeg_path, ffprobe_path)
-            self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
+            translated_text = "\n".join(entry["text"] for entry in translated_entries)
+            tts_key = generate_cache_key(
+                translated_text,
+                settings.tts_provider,
+                settings.target_language,
+                settings.speed,
+                settings.pitch,
+            )
+            tts_audio = cache_dir / f"dub_{tts_key}.wav"
+            if tts_audio.exists():
+                self.log.emit("Restored TTS from cache.")
+            else:
+                self._generate_tts(translated_entries, tts_audio, ffmpeg_path, ffprobe_path)
+                self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
         self._step(80, "Rendering output")
         render_command = [
