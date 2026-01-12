@@ -262,6 +262,7 @@ class AppSettings:
     glossary_instructions: str
     enable_tts: bool
     tts_provider: str
+    force_audio_sync: bool
     speed: float
     pitch: float
     enable_subtitles: bool
@@ -441,6 +442,7 @@ class WorkerThread(QtCore.QThread):
                 settings.target_language,
                 settings.speed,
                 settings.pitch,
+                settings.force_audio_sync,
             )
             tts_audio = cache_dir / f"dub_{tts_key}.wav"
             if tts_audio.exists():
@@ -453,6 +455,8 @@ class WorkerThread(QtCore.QThread):
                     ffmpeg_path,
                     ffprobe_path,
                     video_duration,
+                    cache_dir,
+                    settings.force_audio_sync,
                 )
                 self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
@@ -550,6 +554,8 @@ class WorkerThread(QtCore.QThread):
         ffmpeg_path: Path,
         ffprobe_path: Path,
         video_duration: float,
+        cache_dir: Path,
+        force_audio_sync: bool,
     ):
         segment_paths = []
         for idx, entry in enumerate(entries, start=1):
@@ -559,14 +565,20 @@ class WorkerThread(QtCore.QThread):
             start_time = parse_timestamp(timestamps[0])
             end_time = parse_timestamp(timestamps[1])
             max_duration = max(0.1, end_time - start_time)
-            raw_path = output_path.with_name(f"tts_segment_{idx}.wav")
-            self._generate_tts_segment(entry["text"], raw_path, ffmpeg_path)
-            adjusted_path = self._fit_audio_to_slot(
-                raw_path,
-                max_duration,
+            raw_path = self._generate_tts_segment(
+                entry["text"],
+                idx,
+                cache_dir,
                 ffmpeg_path,
-                ffprobe_path,
             )
+            adjusted_path = raw_path
+            if force_audio_sync:
+                adjusted_path = self._fit_audio_to_slot(
+                    raw_path,
+                    max_duration,
+                    ffmpeg_path,
+                    ffprobe_path,
+                )
             delay_ms = int(start_time * 1000)
             segment_paths.append((adjusted_path, delay_ms))
 
@@ -575,7 +587,25 @@ class WorkerThread(QtCore.QThread):
 
         self._mix_segments(segment_paths, output_path, ffmpeg_path, video_duration)
 
-    def _generate_tts_segment(self, text: str, output_path: Path, ffmpeg_path: Path):
+    def _generate_tts_segment(
+        self,
+        text: str,
+        index: int,
+        cache_dir: Path,
+        ffmpeg_path: Path,
+    ) -> Path:
+        raw_key = generate_cache_key(
+            text,
+            self.settings.tts_provider,
+            self.settings.target_language,
+            self.config.custom_tts_url,
+            self.config.custom_tts_key,
+        )
+        output_path = cache_dir / f"tts_raw_{raw_key}_{index}.wav"
+        if output_path.exists():
+            self.log.emit("Restored TTS segment from cache.")
+            return output_path
+
         temp_output = output_path.with_suffix(".mp3")
         if self.settings.tts_provider == "Edge TTS":
             if edge_tts is None:
@@ -631,6 +661,7 @@ class WorkerThread(QtCore.QThread):
             raise RuntimeError("TTS audio conversion failed.")
         if temp_output.exists():
             temp_output.unlink()
+        return output_path
 
     def _build_atempo_chain(self, speed_factor: float) -> str:
         factors = []
@@ -976,6 +1007,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tts_enable_checkbox = QtWidgets.QCheckBox("Enable TTS")
         self.tts_provider_combo = QtWidgets.QComboBox()
         self.tts_provider_combo.addItems(["Edge TTS", "Custom API"])
+        self.force_sync_checkbox = QtWidgets.QCheckBox("Force Audio Sync (Fit to Slot)")
+        self.force_sync_checkbox.setChecked(True)
+        self.force_sync_checkbox.setToolTip(
+            "If checked, audio speed will be adjusted to fit strictly within the subtitle "
+            "timeline. If unchecked, audio plays at natural speed (may overlap with next "
+            "sentence)."
+        )
         self.speed_input = QtWidgets.QDoubleSpinBox()
         self.speed_input.setRange(0.5, 2.0)
         self.speed_input.setSingleStep(0.1)
@@ -988,10 +1026,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tts_layout.addWidget(self.tts_enable_checkbox, 0, 0, 1, 2)
         tts_layout.addWidget(QtWidgets.QLabel("Provider:"), 1, 0)
         tts_layout.addWidget(self.tts_provider_combo, 1, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Speed:"), 2, 0)
-        tts_layout.addWidget(self.speed_input, 2, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Pitch:"), 3, 0)
-        tts_layout.addWidget(self.pitch_input, 3, 1)
+        tts_layout.addWidget(self.force_sync_checkbox, 2, 0, 1, 2)
+        tts_layout.addWidget(QtWidgets.QLabel("Speed:"), 3, 0)
+        tts_layout.addWidget(self.speed_input, 3, 1)
+        tts_layout.addWidget(QtWidgets.QLabel("Pitch:"), 4, 0)
+        tts_layout.addWidget(self.pitch_input, 4, 1)
 
         layout.addWidget(translation_group)
         layout.addWidget(glossary_group)
@@ -1176,6 +1215,7 @@ class MainWindow(QtWidgets.QMainWindow):
             glossary_instructions=self.glossary_text.toPlainText(),
             enable_tts=self.tts_enable_checkbox.isChecked(),
             tts_provider=self.tts_provider_combo.currentText(),
+            force_audio_sync=self.force_sync_checkbox.isChecked(),
             speed=self.speed_input.value(),
             pitch=float(self.pitch_input.value()),
             enable_subtitles=self.subtitle_enable_checkbox.isChecked(),
