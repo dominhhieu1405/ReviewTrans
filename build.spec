@@ -7,11 +7,12 @@ app_dir = Path(__file__).resolve().parent
 block_cipher = None
 
 a = Analysis(
-    ["main.py"],
+    ["video_translator_app.py"],
     pathex=[str(app_dir)],
     binaries=[],
     datas=[
         (str(app_dir / "bin"), "bin"),
+        (str(app_dir / "models"), "models"),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -48,3 +49,4 @@ coll = COLLECT(
     upx=True,
     name="VideoTranslationStudio",
 )
+

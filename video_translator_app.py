@@ -1,8 +1,4 @@
-from __future__ import annotations
-
 import asyncio
-import importlib
-import importlib.util
 import platform
 import shutil
 import subprocess
@@ -13,33 +9,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
-from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtWidgets
 
-from config_manager import AppConfig, ConfigManager
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+
+try:
+    import openai
+except ImportError:
+    openai = None
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 
 APP_NAME = "Video Translation Studio"
-WHISPER_REPO = "ggerganov/whisper.cpp"
+WHISPER_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 SUPPORTED_VIDEO_EXTENSIONS = "*.mp4 *.mkv *.avi *.mov"
-
-OPENAI_MODELS = ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
-GEMINI_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-flash-latest",
-]
-
-
-def optional_import(name: str):
-    if importlib.util.find_spec(name) is None:
-        return None
-    return importlib.import_module(name)
-
-
-openai = optional_import("openai")
-genai = optional_import("google.generativeai")
-edge_tts = optional_import("edge_tts")
 
 
 def get_resource_path(relative_path: str) -> Path:
@@ -81,21 +71,6 @@ def run_subprocess(command: list[str], log_cb=None) -> int:
     return process.wait()
 
 
-def fetch_whisper_models(log_cb=None) -> list[str]:
-    url = f"https://huggingface.co/api/models/{WHISPER_REPO}"
-    if log_cb:
-        log_cb("Fetching Whisper models from Hugging Face...")
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    models = []
-    for sibling in data.get("siblings", []):
-        filename = sibling.get("rfilename", "")
-        if filename.startswith("ggml-") and filename.endswith(".bin"):
-            models.append(filename.replace("ggml-", "").replace(".bin", ""))
-    return sorted(set(models))
-
-
 def ensure_whisper_model(model: str, models_dir: Path, log_cb=None) -> Path:
     models_dir.mkdir(parents=True, exist_ok=True)
     model_name = f"ggml-{model}.bin"
@@ -103,7 +78,7 @@ def ensure_whisper_model(model: str, models_dir: Path, log_cb=None) -> Path:
     if model_path.exists():
         return model_path
 
-    url = f"https://huggingface.co/{WHISPER_REPO}/resolve/main/{model_name}"
+    url = f"{WHISPER_BASE_URL}/{model_name}"
     if log_cb:
         log_cb(f"Downloading Whisper model from {url}")
     with requests.get(url, stream=True, timeout=60) as response:
@@ -146,13 +121,13 @@ class AppSettings:
     source_language: str
     srt_path: str
     provider: str
-    provider_model: str
     target_language: str
     translate_all: bool
-    glossary_instructions: str
+    glossary: dict
     enable_tts: bool
     tts_provider: str
     custom_api_url: str
+    custom_api_key: str
     speed: float
     pitch: float
     enable_subtitles: bool
@@ -167,19 +142,6 @@ class AppSettings:
     blur_height: int
     blur_mode: str
     cuda: bool
-    output_dir: str
-
-
-class ModelFetchThread(QtCore.QThread):
-    models_ready = QtCore.pyqtSignal(list)
-    failed = QtCore.pyqtSignal(str)
-
-    def run(self):
-        try:
-            models = fetch_whisper_models()
-            self.models_ready.emit(models)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
 
 
 class WorkerThread(QtCore.QThread):
@@ -189,10 +151,9 @@ class WorkerThread(QtCore.QThread):
     finished = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, settings: AppSettings, config: AppConfig, parent=None):
+    def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.config = config
         self._stop_event = threading.Event()
 
     def stop(self):
@@ -242,8 +203,7 @@ class WorkerThread(QtCore.QThread):
             whisper_path = find_tool("whisper")
             if not whisper_path:
                 raise FileNotFoundError("whisper executable not found in bin/ or tools/ folder.")
-            models_dir = Path.home() / ".video_translation_studio" / "models"
-            model_path = ensure_whisper_model(settings.whisper_model, models_dir, self.log.emit)
+            model_path = ensure_whisper_model(settings.whisper_model, get_resource_path("models"), self.log.emit)
             srt_path = work_dir / "transcript.srt"
             whisper_command = [
                 str(whisper_path),
@@ -281,6 +241,7 @@ class WorkerThread(QtCore.QThread):
             self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
         self._step(80, "Rendering output")
+        output_path = work_dir / "output.mp4"
         filters = []
         if settings.enable_subtitles:
             subtitle_filter = self._build_subtitle_filter(translated_srt, settings)
@@ -308,9 +269,6 @@ class WorkerThread(QtCore.QThread):
             duck_volume = max(0.1, settings.duck_audio / 100.0)
             render_command += ["-filter:a", f"volume={duck_volume}"]
 
-        output_dir = Path(settings.output_dir or work_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{Path(settings.video_path).stem}_translated.mp4"
         render_command.append(str(output_path))
         if run_subprocess(render_command, self.log.emit) != 0:
             raise RuntimeError("Video rendering failed.")
@@ -323,10 +281,12 @@ class WorkerThread(QtCore.QThread):
         self.status.emit(message)
 
     def _translate_entries(self, entries: list[dict], settings: AppSettings) -> list[dict]:
-        if settings.provider == "ChatGPT" and openai is None:
-            raise RuntimeError("openai package not installed.")
-        if settings.provider == "Gemini" and genai is None:
-            raise RuntimeError("google-generativeai package not installed.")
+        if settings.provider == "ChatGPT":
+            if openai is None:
+                raise RuntimeError("openai package not installed.")
+        if settings.provider == "Gemini":
+            if genai is None:
+                raise RuntimeError("google-generativeai package not installed.")
 
         if settings.translate_all:
             combined_text = "\n".join(entry["text"] for entry in entries)
@@ -339,30 +299,28 @@ class WorkerThread(QtCore.QThread):
                 entry["text"] = self._translate_text(entry["text"], settings)
         return entries
 
+    def _apply_glossary(self, text: str, glossary: dict) -> str:
+        for source, target in glossary.items():
+            text = text.replace(source, target)
+        return text
+
     def _translate_text(self, text: str, settings: AppSettings) -> str:
-        glossary = settings.glossary_instructions.strip()
-        system_instructions = "You are a professional translator."
-        if glossary:
-            system_instructions += f"\nAdditional instructions:\n{glossary}"
+        text = self._apply_glossary(text, settings.glossary)
         prompt = (
             f"Translate the following text to {settings.target_language}.\n"
-            "Preserve line breaks and do not add commentary.\n\n"
-            f"{text}"
+            f"Preserve line breaks and do not add commentary.\n\n{text}"
         )
         if settings.provider == "ChatGPT":
-            client = openai.OpenAI(api_key=self.config.openai_api_key)
+            client = openai.OpenAI()
             response = client.chat.completions.create(
-                model=settings.provider_model,
-                messages=[
-                    {"role": "system", "content": system_instructions},
-                    {"role": "user", "content": prompt},
-                ],
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
             )
             return response.choices[0].message.content.strip()
         if settings.provider == "Gemini":
-            genai.configure(api_key=self.config.gemini_api_key)
-            model = genai.GenerativeModel(settings.provider_model)
-            response = model.generate_content(f"{system_instructions}\n\n{prompt}")
+            genai.configure()
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
             return response.text.strip()
         return text
 
@@ -387,8 +345,8 @@ class WorkerThread(QtCore.QThread):
                 "language": self.settings.target_language,
             }
             headers = {}
-            if self.config.custom_tts_key:
-                headers["Authorization"] = self.config.custom_tts_key
+            if self.settings.custom_api_key:
+                headers["Authorization"] = self.settings.custom_api_key
             response = requests.post(
                 self.settings.custom_api_url,
                 data=payload,
@@ -442,125 +400,97 @@ class WorkerThread(QtCore.QThread):
         height_ratio = max(1, min(100, settings.blur_height)) / 100.0
         if settings.blur_mode == "Blur":
             return (
-                "boxblur=luma_radius=10:luma_power=1:"
-                "chroma_radius=10:chroma_power=1"
+                f"boxblur=luma_radius=10:luma_power=1:"
+                f"chroma_radius=10:chroma_power=1"
             )
         color = "black"
         return f"drawbox=y=ih*{1 - height_ratio}:h=ih*{height_ratio}:color={color}:t=fill"
 
 
-class SettingsDialog(QtWidgets.QDialog):
-    def __init__(self, config_manager: ConfigManager, parent=None):
+class GlossaryDialog(QtWidgets.QDialog):
+    def __init__(self, glossary: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.resize(500, 400)
-        self.config_manager = config_manager
-        self.config = config_manager.config
+        self.setWindowTitle("Edit Glossary")
+        self.resize(400, 300)
+        self.table = QtWidgets.QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Source", "Target"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for source, target in glossary.items():
+            self._add_row(source, target)
 
-        layout = QtWidgets.QFormLayout(self)
-        self.openai_key_edit = QtWidgets.QLineEdit(self.config.openai_api_key)
-        self.openai_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self.gemini_key_edit = QtWidgets.QLineEdit(self.config.gemini_api_key)
-        self.gemini_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self.custom_tts_key_edit = QtWidgets.QLineEdit(self.config.custom_tts_key)
-        self.custom_tts_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self.output_dir_edit = QtWidgets.QLineEdit(self.config.default_output_dir)
-        output_button = QtWidgets.QPushButton("Browse")
-        output_button.clicked.connect(self._browse_output_dir)
-        output_layout = QtWidgets.QHBoxLayout()
-        output_layout.addWidget(self.output_dir_edit)
-        output_layout.addWidget(output_button)
-
-        layout.addRow("OpenAI API Key:", self.openai_key_edit)
-        layout.addRow("Gemini API Key:", self.gemini_key_edit)
-        layout.addRow("Custom TTS Key:", self.custom_tts_key_edit)
-        layout.addRow("Default Output Folder:", output_layout)
-
+        add_button = QtWidgets.QPushButton("Add")
+        remove_button = QtWidgets.QPushButton("Remove")
         button_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Save
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
         )
-        button_box.accepted.connect(self._save)
+
+        add_button.clicked.connect(lambda: self._add_row("", ""))
+        remove_button.clicked.connect(self._remove_selected)
+        button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
-        layout.addRow(button_box)
 
-    def _browse_output_dir(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder")
-        if path:
-            self.output_dir_edit.setText(path)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.table)
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(add_button)
+        controls.addWidget(remove_button)
+        controls.addStretch()
+        layout.addLayout(controls)
+        layout.addWidget(button_box)
 
-    def _save(self):
-        self.config.openai_api_key = self.openai_key_edit.text().strip()
-        self.config.gemini_api_key = self.gemini_key_edit.text().strip()
-        self.config.custom_tts_key = self.custom_tts_key_edit.text().strip()
-        self.config.default_output_dir = self.output_dir_edit.text().strip()
-        self.config_manager.save()
-        self.accept()
+    def _add_row(self, source: str, target: str):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(source))
+        self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(target))
+
+    def _remove_selected(self):
+        for index in sorted({item.row() for item in self.table.selectedItems()}, reverse=True):
+            self.table.removeRow(index)
+
+    def get_glossary(self) -> dict:
+        glossary = {}
+        for row in range(self.table.rowCount()):
+            source_item = self.table.item(row, 0)
+            target_item = self.table.item(row, 1)
+            if source_item and target_item:
+                source = source_item.text().strip()
+                target = target_item.text().strip()
+                if source:
+                    glossary[source] = target
+        return glossary
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, config_manager: ConfigManager):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1300, 750)
-        self.config_manager = config_manager
-        self.config = config_manager.config
+        self.resize(1100, 750)
+        self.glossary = {}
         self.worker = None
-        self.model_fetch_thread = None
-
-        self._build_menu()
-        self._apply_theme()
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        main_layout = QtWidgets.QHBoxLayout(central)
+        layout = QtWidgets.QVBoxLayout(central)
 
-        column_layout = QtWidgets.QHBoxLayout()
-        main_layout.addLayout(column_layout)
-
-        column_layout.addWidget(self._build_input_column())
-        column_layout.addWidget(self._build_processing_column())
-        column_layout.addWidget(self._build_output_column())
+        layout.addWidget(self._build_input_section())
+        layout.addWidget(self._build_translation_section())
+        layout.addWidget(self._build_tts_section())
+        layout.addWidget(self._build_subtitle_section())
+        layout.addWidget(self._build_post_section())
+        layout.addWidget(self._build_execution_section())
 
         self._update_source_mode()
         self._update_tts_provider()
-        self._update_provider_models()
-        self._load_defaults()
-        self._fetch_models_async()
 
-    def _build_menu(self):
-        menu = self.menuBar().addMenu("Settings")
-        settings_action = QtGui.QAction("Preferences", self)
-        settings_action.triggered.connect(self._open_settings)
-        menu.addAction(settings_action)
-
-    def _apply_theme(self):
-        palette = QtGui.QPalette()
-        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#1e1e1e"))
-        palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#f0f0f0"))
-        palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#2b2b2b"))
-        palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#3a3a3a"))
-        palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#f0f0f0"))
-        palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#3c3c3c"))
-        palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#f0f0f0"))
-        palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#0078d4"))
-        palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
-        self.setPalette(palette)
-
-    def _build_input_column(self):
-        group = QtWidgets.QGroupBox("Column 1: Input")
-        layout = QtWidgets.QVBoxLayout(group)
+    def _build_input_section(self):
+        group = QtWidgets.QGroupBox("1. Input")
+        layout = QtWidgets.QGridLayout(group)
 
         self.video_path_edit = QtWidgets.QLineEdit()
         browse_button = QtWidgets.QPushButton("Browse Video")
         browse_button.clicked.connect(self._browse_video)
-
-        video_layout = QtWidgets.QHBoxLayout()
-        video_layout.addWidget(self.video_path_edit)
-        video_layout.addWidget(browse_button)
-
-        source_group = QtWidgets.QGroupBox("Source Audio")
-        source_layout = QtWidgets.QGridLayout(source_group)
 
         self.asr_radio = QtWidgets.QRadioButton("ASR (Automatic Speech Recognition)")
         self.srt_radio = QtWidgets.QRadioButton("SRT File")
@@ -568,7 +498,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.asr_radio.toggled.connect(self._update_source_mode)
 
         self.model_combo = QtWidgets.QComboBox()
-        self.model_combo.setPlaceholderText("Loading models...")
+        self.model_combo.addItems(["tiny", "base", "small", "medium", "large"])
         self.source_lang_combo = QtWidgets.QComboBox()
         self.source_lang_combo.addItems(["auto", "en", "vi", "zh", "ja", "ko", "fr", "de", "es"])
 
@@ -576,60 +506,50 @@ class MainWindow(QtWidgets.QMainWindow):
         srt_button = QtWidgets.QPushButton("Browse SRT")
         srt_button.clicked.connect(self._browse_srt)
 
-        source_layout.addWidget(self.asr_radio, 0, 0, 1, 2)
-        source_layout.addWidget(QtWidgets.QLabel("Whisper Model:"), 1, 0)
-        source_layout.addWidget(self.model_combo, 1, 1)
-        source_layout.addWidget(QtWidgets.QLabel("Source Language:"), 2, 0)
-        source_layout.addWidget(self.source_lang_combo, 2, 1)
-        source_layout.addWidget(self.srt_radio, 3, 0, 1, 2)
-        source_layout.addWidget(self.srt_path_edit, 4, 0)
-        source_layout.addWidget(srt_button, 4, 1)
-
-        layout.addWidget(QtWidgets.QLabel("Video File"))
-        layout.addLayout(video_layout)
-        layout.addWidget(source_group)
-        layout.addStretch()
+        layout.addWidget(QtWidgets.QLabel("Video:"), 0, 0)
+        layout.addWidget(self.video_path_edit, 0, 1)
+        layout.addWidget(browse_button, 0, 2)
+        layout.addWidget(self.asr_radio, 1, 0, 1, 3)
+        layout.addWidget(QtWidgets.QLabel("Whisper Model:"), 2, 0)
+        layout.addWidget(self.model_combo, 2, 1)
+        layout.addWidget(QtWidgets.QLabel("Source Language:"), 2, 2)
+        layout.addWidget(self.source_lang_combo, 2, 3)
+        layout.addWidget(self.srt_radio, 3, 0, 1, 3)
+        layout.addWidget(self.srt_path_edit, 4, 1)
+        layout.addWidget(srt_button, 4, 2)
         return group
 
-    def _build_processing_column(self):
-        group = QtWidgets.QGroupBox("Column 2: Processing")
-        layout = QtWidgets.QVBoxLayout(group)
-
-        translation_group = QtWidgets.QGroupBox("Translation")
-        translation_layout = QtWidgets.QGridLayout(translation_group)
+    def _build_translation_section(self):
+        group = QtWidgets.QGroupBox("2. Translation")
+        layout = QtWidgets.QGridLayout(group)
 
         self.provider_combo = QtWidgets.QComboBox()
         self.provider_combo.addItems(["ChatGPT", "Gemini"])
-        self.provider_combo.currentTextChanged.connect(self._update_provider_models)
-        self.model_combo_provider = QtWidgets.QComboBox()
         self.target_lang_combo = QtWidgets.QComboBox()
         self.target_lang_combo.addItems(["en", "vi", "zh-cn", "ja", "ko", "fr", "de", "es"])
         self.translate_all_checkbox = QtWidgets.QCheckBox("Translate All at Once")
+        self.translate_all_checkbox.setChecked(True)
+        glossary_button = QtWidgets.QPushButton("Edit Glossary")
+        glossary_button.clicked.connect(self._edit_glossary)
 
-        translation_layout.addWidget(QtWidgets.QLabel("Provider:"), 0, 0)
-        translation_layout.addWidget(self.provider_combo, 0, 1)
-        translation_layout.addWidget(QtWidgets.QLabel("Model:"), 1, 0)
-        translation_layout.addWidget(self.model_combo_provider, 1, 1)
-        translation_layout.addWidget(QtWidgets.QLabel("Target Language:"), 2, 0)
-        translation_layout.addWidget(self.target_lang_combo, 2, 1)
-        translation_layout.addWidget(self.translate_all_checkbox, 3, 0, 1, 2)
+        layout.addWidget(QtWidgets.QLabel("Provider:"), 0, 0)
+        layout.addWidget(self.provider_combo, 0, 1)
+        layout.addWidget(QtWidgets.QLabel("Target Language:"), 0, 2)
+        layout.addWidget(self.target_lang_combo, 0, 3)
+        layout.addWidget(self.translate_all_checkbox, 1, 0, 1, 2)
+        layout.addWidget(glossary_button, 1, 2)
+        return group
 
-        glossary_group = QtWidgets.QGroupBox("Glossary / Instructions")
-        glossary_layout = QtWidgets.QVBoxLayout(glossary_group)
-        self.glossary_text = QtWidgets.QTextEdit()
-        self.glossary_text.setPlaceholderText(
-            "Enter translation rules or instructions here (free-form)."
-        )
-        glossary_layout.addWidget(self.glossary_text)
-
-        tts_group = QtWidgets.QGroupBox("Dubbing (TTS)")
-        tts_layout = QtWidgets.QGridLayout(tts_group)
+    def _build_tts_section(self):
+        group = QtWidgets.QGroupBox("3. Dubbing (TTS)")
+        layout = QtWidgets.QGridLayout(group)
         self.tts_enable_checkbox = QtWidgets.QCheckBox("Enable TTS")
         self.tts_provider_combo = QtWidgets.QComboBox()
         self.tts_provider_combo.addItems(["Edge TTS", "Custom API"])
         self.tts_provider_combo.currentTextChanged.connect(self._update_tts_provider)
         self.api_url_edit = QtWidgets.QLineEdit()
-        self.api_url_edit.setPlaceholderText("Custom API URL")
+        self.api_key_edit = QtWidgets.QLineEdit()
+        self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.speed_slider.setMinimum(50)
         self.speed_slider.setMaximum(200)
@@ -639,29 +559,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pitch_slider.setMaximum(12)
         self.pitch_slider.setValue(0)
 
-        tts_layout.addWidget(self.tts_enable_checkbox, 0, 0, 1, 2)
-        tts_layout.addWidget(QtWidgets.QLabel("Provider:"), 1, 0)
-        tts_layout.addWidget(self.tts_provider_combo, 1, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Custom API URL:"), 2, 0)
-        tts_layout.addWidget(self.api_url_edit, 2, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Speed:"), 3, 0)
-        tts_layout.addWidget(self.speed_slider, 3, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Pitch:"), 4, 0)
-        tts_layout.addWidget(self.pitch_slider, 4, 1)
-
-        layout.addWidget(translation_group)
-        layout.addWidget(glossary_group)
-        layout.addWidget(tts_group)
-        layout.addStretch()
+        layout.addWidget(self.tts_enable_checkbox, 0, 0)
+        layout.addWidget(QtWidgets.QLabel("Provider:"), 1, 0)
+        layout.addWidget(self.tts_provider_combo, 1, 1)
+        layout.addWidget(QtWidgets.QLabel("Custom API URL:"), 2, 0)
+        layout.addWidget(self.api_url_edit, 2, 1)
+        layout.addWidget(QtWidgets.QLabel("API Key:"), 2, 2)
+        layout.addWidget(self.api_key_edit, 2, 3)
+        layout.addWidget(QtWidgets.QLabel("Speed:"), 3, 0)
+        layout.addWidget(self.speed_slider, 3, 1)
+        layout.addWidget(QtWidgets.QLabel("Pitch:"), 3, 2)
+        layout.addWidget(self.pitch_slider, 3, 3)
         return group
 
-    def _build_output_column(self):
-        group = QtWidgets.QGroupBox("Column 3: Output / Preview")
-        layout = QtWidgets.QVBoxLayout(group)
-
-        subtitle_group = QtWidgets.QGroupBox("Subtitles")
-        subtitle_layout = QtWidgets.QGridLayout(subtitle_group)
+    def _build_subtitle_section(self):
+        group = QtWidgets.QGroupBox("4. Subtitles")
+        layout = QtWidgets.QGridLayout(group)
         self.subtitle_enable_checkbox = QtWidgets.QCheckBox("Enable Subtitles")
+        self.subtitle_enable_checkbox.setChecked(True)
         self.font_family_edit = QtWidgets.QLineEdit("Arial")
         self.font_size_spin = QtWidgets.QSpinBox()
         self.font_size_spin.setRange(8, 72)
@@ -675,21 +590,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.position_combo = QtWidgets.QComboBox()
         self.position_combo.addItems(["Bottom", "Center", "Top"])
 
-        subtitle_layout.addWidget(self.subtitle_enable_checkbox, 0, 0, 1, 2)
-        subtitle_layout.addWidget(QtWidgets.QLabel("Font Family:"), 1, 0)
-        subtitle_layout.addWidget(self.font_family_edit, 1, 1)
-        subtitle_layout.addWidget(QtWidgets.QLabel("Font Size:"), 2, 0)
-        subtitle_layout.addWidget(self.font_size_spin, 2, 1)
-        subtitle_layout.addWidget(QtWidgets.QLabel("Text Color:"), 3, 0)
-        subtitle_layout.addWidget(self.text_color_button, 3, 1)
-        subtitle_layout.addWidget(self.text_color_display, 4, 0, 1, 2)
-        subtitle_layout.addWidget(QtWidgets.QLabel("Border Width:"), 5, 0)
-        subtitle_layout.addWidget(self.border_width_spin, 5, 1)
-        subtitle_layout.addWidget(QtWidgets.QLabel("Position:"), 6, 0)
-        subtitle_layout.addWidget(self.position_combo, 6, 1)
+        layout.addWidget(self.subtitle_enable_checkbox, 0, 0)
+        layout.addWidget(QtWidgets.QLabel("Font Family:"), 1, 0)
+        layout.addWidget(self.font_family_edit, 1, 1)
+        layout.addWidget(QtWidgets.QLabel("Font Size:"), 1, 2)
+        layout.addWidget(self.font_size_spin, 1, 3)
+        layout.addWidget(QtWidgets.QLabel("Text Color:"), 2, 0)
+        layout.addWidget(self.text_color_button, 2, 1)
+        layout.addWidget(self.text_color_display, 2, 2)
+        layout.addWidget(QtWidgets.QLabel("Border Width:"), 2, 3)
+        layout.addWidget(self.border_width_spin, 2, 4)
+        layout.addWidget(QtWidgets.QLabel("Position:"), 3, 0)
+        layout.addWidget(self.position_combo, 3, 1)
+        return group
 
-        post_group = QtWidgets.QGroupBox("Post-Processing")
-        post_layout = QtWidgets.QGridLayout(post_group)
+    def _build_post_section(self):
+        group = QtWidgets.QGroupBox("5. Post-Processing")
+        layout = QtWidgets.QGridLayout(group)
         self.mute_radio = QtWidgets.QRadioButton("Mute Original")
         self.duck_radio = QtWidgets.QRadioButton("Duck Audio")
         self.mute_radio.setChecked(True)
@@ -703,20 +620,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blur_height_spin.setValue(20)
         self.blur_mode_combo = QtWidgets.QComboBox()
         self.blur_mode_combo.addItems(["Blur", "Solid Color Fill"])
+
+        layout.addWidget(self.mute_radio, 0, 0)
+        layout.addWidget(self.duck_radio, 0, 1)
+        layout.addWidget(QtWidgets.QLabel("Duck Volume:"), 0, 2)
+        layout.addWidget(self.duck_slider, 0, 3)
+        layout.addWidget(self.blur_checkbox, 1, 0)
+        layout.addWidget(QtWidgets.QLabel("Height %:"), 1, 1)
+        layout.addWidget(self.blur_height_spin, 1, 2)
+        layout.addWidget(self.blur_mode_combo, 1, 3)
+        return group
+
+    def _build_execution_section(self):
+        group = QtWidgets.QGroupBox("6. Execution & Status")
+        layout = QtWidgets.QGridLayout(group)
         self.cuda_checkbox = QtWidgets.QCheckBox("Enable CUDA Acceleration")
-
-        post_layout.addWidget(self.mute_radio, 0, 0)
-        post_layout.addWidget(self.duck_radio, 0, 1)
-        post_layout.addWidget(QtWidgets.QLabel("Duck Volume:"), 1, 0)
-        post_layout.addWidget(self.duck_slider, 1, 1)
-        post_layout.addWidget(self.blur_checkbox, 2, 0)
-        post_layout.addWidget(QtWidgets.QLabel("Height %:"), 3, 0)
-        post_layout.addWidget(self.blur_height_spin, 3, 1)
-        post_layout.addWidget(self.blur_mode_combo, 4, 0, 1, 2)
-        post_layout.addWidget(self.cuda_checkbox, 5, 0, 1, 2)
-
-        execution_group = QtWidgets.QGroupBox("Execution & Status")
-        execution_layout = QtWidgets.QVBoxLayout(execution_group)
         self.start_button = QtWidgets.QPushButton("Start")
         self.start_button.clicked.connect(self._start_processing)
         self.progress_bar = QtWidgets.QProgressBar()
@@ -724,65 +642,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_console = QtWidgets.QTextEdit()
         self.log_console.setReadOnly(True)
 
-        execution_layout.addWidget(self.start_button)
-        execution_layout.addWidget(self.progress_bar)
-        execution_layout.addWidget(self.status_label)
-        execution_layout.addWidget(self.log_console)
-
-        layout.addWidget(subtitle_group)
-        layout.addWidget(post_group)
-        layout.addWidget(execution_group)
+        layout.addWidget(self.cuda_checkbox, 0, 0)
+        layout.addWidget(self.start_button, 0, 1)
+        layout.addWidget(self.progress_bar, 1, 0, 1, 2)
+        layout.addWidget(self.status_label, 2, 0, 1, 2)
+        layout.addWidget(self.log_console, 3, 0, 1, 2)
         return group
-
-    def _load_defaults(self):
-        self.target_lang_combo.setCurrentText(self.config.default_target_language)
-        self.provider_combo.setCurrentText(self.config.default_provider)
-        self.tts_provider_combo.setCurrentText(self.config.default_tts_provider)
-        self.translate_all_checkbox.setChecked(self.config.default_translate_all)
-        self.tts_enable_checkbox.setChecked(self.config.default_enable_tts)
-        self.subtitle_enable_checkbox.setChecked(self.config.default_enable_subtitles)
-        self.source_lang_combo.setCurrentText(self.config.default_whisper_language)
-
-    def _open_settings(self):
-        dialog = SettingsDialog(self.config_manager, self)
-        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            self.config = self.config_manager.config
-
-    def _fetch_models_async(self):
-        self.model_fetch_thread = ModelFetchThread()
-        self.model_fetch_thread.models_ready.connect(self._apply_models)
-        self.model_fetch_thread.failed.connect(self._log_model_error)
-        self.model_fetch_thread.start()
-
-    def _apply_models(self, models: list[str]):
-        self.model_combo.clear()
-        if not models:
-            self.model_combo.addItem("No models found")
-            return
-        self.model_combo.addItems(models)
-
-    def _log_model_error(self, error: str):
-        self.log_console.append(f"Model fetch failed: {error}")
-        self.model_combo.clear()
-        self.model_combo.addItem("Model fetch failed")
-
-    def _update_source_mode(self):
-        asr_enabled = self.asr_radio.isChecked()
-        self.model_combo.setEnabled(asr_enabled)
-        self.source_lang_combo.setEnabled(asr_enabled)
-        self.srt_path_edit.setEnabled(not asr_enabled)
-
-    def _update_provider_models(self):
-        provider = self.provider_combo.currentText()
-        self.model_combo_provider.clear()
-        if provider == "ChatGPT":
-            self.model_combo_provider.addItems(OPENAI_MODELS)
-        else:
-            self.model_combo_provider.addItems(GEMINI_MODELS)
-
-    def _update_tts_provider(self):
-        use_custom = self.tts_provider_combo.currentText() == "Custom API"
-        self.api_url_edit.setVisible(use_custom)
 
     def _browse_video(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -809,6 +674,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if color.isValid():
             self.text_color_display.setText(color.name())
 
+    def _edit_glossary(self):
+        dialog = GlossaryDialog(self.glossary, self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.glossary = dialog.get_glossary()
+
+    def _update_source_mode(self):
+        asr_enabled = self.asr_radio.isChecked()
+        self.model_combo.setEnabled(asr_enabled)
+        self.source_lang_combo.setEnabled(asr_enabled)
+        self.srt_path_edit.setEnabled(not asr_enabled)
+
+    def _update_tts_provider(self):
+        use_custom = self.tts_provider_combo.currentText() == "Custom API"
+        self.api_url_edit.setVisible(use_custom)
+        self.api_key_edit.setVisible(use_custom)
+
     def _start_processing(self):
         if self.worker and self.worker.isRunning():
             QtWidgets.QMessageBox.warning(self, "Busy", "Processing already running.")
@@ -821,13 +702,13 @@ class MainWindow(QtWidgets.QMainWindow):
             source_language=self.source_lang_combo.currentText(),
             srt_path=self.srt_path_edit.text().strip(),
             provider=self.provider_combo.currentText(),
-            provider_model=self.model_combo_provider.currentText(),
             target_language=self.target_lang_combo.currentText(),
             translate_all=self.translate_all_checkbox.isChecked(),
-            glossary_instructions=self.glossary_text.toPlainText(),
+            glossary=self.glossary,
             enable_tts=self.tts_enable_checkbox.isChecked(),
             tts_provider=self.tts_provider_combo.currentText(),
             custom_api_url=self.api_url_edit.text().strip(),
+            custom_api_key=self.api_key_edit.text().strip(),
             speed=self.speed_slider.value() / 100.0,
             pitch=float(self.pitch_slider.value()),
             enable_subtitles=self.subtitle_enable_checkbox.isChecked(),
@@ -842,16 +723,18 @@ class MainWindow(QtWidgets.QMainWindow):
             blur_height=self.blur_height_spin.value(),
             blur_mode=self.blur_mode_combo.currentText(),
             cuda=self.cuda_checkbox.isChecked(),
-            output_dir=self.config.default_output_dir,
         )
 
-        self.worker = WorkerThread(settings, self.config)
+        self.worker = WorkerThread(settings)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.status.connect(self.status_label.setText)
-        self.worker.log.connect(self.log_console.append)
+        self.worker.log.connect(self._append_log)
         self.worker.finished.connect(self._handle_finished)
         self.worker.failed.connect(self._handle_failed)
         self.worker.start()
+
+    def _append_log(self, text: str):
+        self.log_console.append(text)
 
     def _handle_finished(self, output_path: str):
         self.status_label.setText("Done")
@@ -864,8 +747,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    config_manager = ConfigManager()
-    window = MainWindow(config_manager)
+    window = MainWindow()
     window.show()
     sys.exit(app.exec())
 
