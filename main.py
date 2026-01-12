@@ -39,8 +39,11 @@ def optional_import(name: str):
 
 
 openai = optional_import("openai")
-genai = optional_import("google.generativeai")
 edge_tts = optional_import("edge_tts")
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
 
 def get_resource_path(relative_path: str) -> Path:
@@ -392,7 +395,7 @@ class WorkerThread(QtCore.QThread):
         if settings.provider == "ChatGPT" and openai is None:
             raise RuntimeError("openai package not installed.")
         if settings.provider == "Gemini" and genai is None:
-            raise RuntimeError("google-generativeai package not installed.")
+            raise RuntimeError("google-genai package not installed.")
 
         if settings.translate_all:
             combined_text = "\n".join(entry["text"] for entry in entries)
@@ -426,9 +429,11 @@ class WorkerThread(QtCore.QThread):
             )
             return response.choices[0].message.content.strip()
         if settings.provider == "Gemini":
-            genai.configure(api_key=self.config.gemini_api_key)
-            model = genai.GenerativeModel(settings.provider_model)
-            response = model.generate_content(f"{system_instructions}\n\n{prompt}")
+            client = genai.Client(api_key=self.config.gemini_api_key)
+            response = client.models.generate_content(
+                model=settings.provider_model,
+                contents=f"{system_instructions}\n\n{prompt}",
+            )
             return response.text.strip()
         return text
 
