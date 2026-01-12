@@ -3,7 +3,7 @@
 ## 1. Install dependencies
 
 ```bash
-pip install pyinstaller PyQt6 requests edge-tts openai google-generativeai
+pip install pyinstaller PyQt6 requests edge-tts openai google-genai
 ```
 
 ## 2. Folder layout
