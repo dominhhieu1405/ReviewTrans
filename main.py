@@ -157,6 +157,34 @@ def get_audio_duration(path: Path, ffprobe_path: Path) -> float:
         return 0.0
 
 
+def get_video_duration(path: Path, ffprobe_path: Path) -> float:
+    command = [
+        str(ffprobe_path),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    try:
+        return float(process.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
 def fetch_whisper_models(log_cb=None) -> list[str]:
     url = f"https://huggingface.co/api/models/{WHISPER_REPO}"
     if log_cb:
@@ -418,7 +446,14 @@ class WorkerThread(QtCore.QThread):
             if tts_audio.exists():
                 self.log.emit("Restored TTS from cache.")
             else:
-                self._generate_tts(translated_entries, tts_audio, ffmpeg_path, ffprobe_path)
+                video_duration = get_video_duration(Path(settings.video_path), ffprobe_path)
+                self._generate_tts(
+                    translated_entries,
+                    tts_audio,
+                    ffmpeg_path,
+                    ffprobe_path,
+                    video_duration,
+                )
                 self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
         self._step(80, "Rendering output")
@@ -514,6 +549,7 @@ class WorkerThread(QtCore.QThread):
         output_path: Path,
         ffmpeg_path: Path,
         ffprobe_path: Path,
+        video_duration: float,
     ):
         segment_paths = []
         for idx, entry in enumerate(entries, start=1):
@@ -525,7 +561,7 @@ class WorkerThread(QtCore.QThread):
             max_duration = max(0.1, end_time - start_time)
             raw_path = output_path.with_name(f"tts_segment_{idx}.wav")
             self._generate_tts_segment(entry["text"], raw_path, ffmpeg_path)
-            adjusted_path = self._check_and_speed_up_audio(
+            adjusted_path = self._fit_audio_to_slot(
                 raw_path,
                 max_duration,
                 ffmpeg_path,
@@ -537,7 +573,7 @@ class WorkerThread(QtCore.QThread):
         if not segment_paths:
             raise RuntimeError("No TTS segments generated.")
 
-        self._mix_segments(segment_paths, output_path, ffmpeg_path)
+        self._mix_segments(segment_paths, output_path, ffmpeg_path, video_duration)
 
     def _generate_tts_segment(self, text: str, output_path: Path, ffmpeg_path: Path):
         temp_output = output_path.with_suffix(".mp3")
@@ -596,7 +632,16 @@ class WorkerThread(QtCore.QThread):
         if temp_output.exists():
             temp_output.unlink()
 
-    def _check_and_speed_up_audio(
+    def _build_atempo_chain(self, speed_factor: float) -> str:
+        factors = []
+        remaining = speed_factor
+        while remaining > 2.0:
+            factors.append(2.0)
+            remaining /= 2.0
+        factors.append(max(0.5, min(2.0, remaining)))
+        return ",".join(f"atempo={factor}" for factor in factors)
+
+    def _fit_audio_to_slot(
         self,
         file_path: Path,
         max_duration: float,
@@ -604,17 +649,19 @@ class WorkerThread(QtCore.QThread):
         ffprobe_path: Path,
     ) -> Path:
         current_duration = get_audio_duration(file_path, ffprobe_path)
-        if current_duration <= 0 or current_duration <= max_duration:
+        if current_duration <= 0:
             return file_path
-        speed_factor = min(2.0, max(1.0, current_duration / max_duration))
-        adjusted_path = file_path.with_name(f"{file_path.stem}_fast.wav")
+        speed_factor = current_duration / max_duration if current_duration > max_duration else 1.0
+        atempo_chain = self._build_atempo_chain(speed_factor)
+        adjusted_path = file_path.with_name(f"{file_path.stem}_fit.wav")
+        filter_chain = f"{atempo_chain},apad=pad_dur={max_duration},atrim=0:{max_duration}"
         command = [
             str(ffmpeg_path),
             "-y",
             "-i",
             str(file_path),
             "-filter:a",
-            f"atempo={speed_factor}",
+            filter_chain,
             str(adjusted_path),
         ]
         if run_subprocess(command, self.log.emit) != 0:
@@ -626,6 +673,7 @@ class WorkerThread(QtCore.QThread):
         segment_paths: list[tuple[Path, int]],
         output_path: Path,
         ffmpeg_path: Path,
+        video_duration: float,
     ):
         command = [str(ffmpeg_path), "-y"]
         filter_parts = []
@@ -654,6 +702,21 @@ class WorkerThread(QtCore.QThread):
         ]
         if run_subprocess(command, self.log.emit) != 0:
             raise RuntimeError("TTS segment mixing failed.")
+
+        if video_duration > 0:
+            trimmed_output = output_path.with_name(f"{output_path.stem}_dur.wav")
+            trim_command = [
+                str(ffmpeg_path),
+                "-y",
+                "-i",
+                str(output_path),
+                "-filter:a",
+                f"apad=pad_dur={video_duration},atrim=0:{video_duration}",
+                str(trimmed_output),
+            ]
+            if run_subprocess(trim_command, self.log.emit) != 0:
+                raise RuntimeError("Audio duration trim failed.")
+            shutil.move(trimmed_output, output_path)
 
     def _apply_audio_fx(self, audio_path: Path, settings: AppSettings, ffmpeg_path: Path):
         if settings.speed == 1.0 and settings.pitch == 0.0:
@@ -708,16 +771,15 @@ class WorkerThread(QtCore.QThread):
         crop_y = f"ih-{crop_h}"
         blur_filter = self._build_blur_filter(settings)
         filter_parts = [
-            "[0:v]split[base][orig]",
-            f"[orig]crop=iw:{crop_h}:0:{crop_y}[bottom]",
+            f"[0:v]crop=iw:{crop_h}:0:{crop_y}[bottom]",
             f"[bottom]{blur_filter}[blurred]",
-            "[base][blurred]overlay=0:main_h-overlay_h[blurred_full]",
+            "[0:v][blurred]overlay=0:main_h-overlay_h[bg_processed]",
         ]
         if settings.enable_subtitles:
             subtitle_filter = self._build_subtitle_filter(srt_path, settings)
-            filter_parts.append(f"[blurred_full]{subtitle_filter}[vout]")
+            filter_parts.append(f"[bg_processed]{subtitle_filter}[vout]")
         else:
-            filter_parts.append("[blurred_full]null[vout]")
+            filter_parts.append("[bg_processed]null[vout]")
         filter_complex = ";".join(filter_parts)
         return ["-filter_complex", filter_complex, "-map", "[vout]"]
 
