@@ -131,6 +131,32 @@ def run_subprocess(command: list[str], log_cb=None) -> int:
     return process.wait()
 
 
+def get_audio_duration(path: Path, ffprobe_path: Path) -> float:
+    command = [
+        str(ffprobe_path),
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    try:
+        return float(process.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
 def fetch_whisper_models(log_cb=None) -> list[str]:
     url = f"https://huggingface.co/api/models/{WHISPER_REPO}"
     if log_cb:
@@ -179,6 +205,12 @@ def parse_srt(content: str) -> list[dict]:
         text = " ".join(line.strip() for line in lines[2:])
         entries.append({"index": index, "timestamps": timestamps, "text": text})
     return entries
+
+
+def parse_timestamp(timestamp: str) -> float:
+    hours, minutes, seconds = timestamp.split(":")
+    seconds, millis = seconds.split(",")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
 
 
 def render_srt(entries: list[dict]) -> str:
@@ -347,18 +379,10 @@ class WorkerThread(QtCore.QThread):
         if settings.enable_tts:
             self._step(60, "Generating TTS")
             tts_audio = work_dir / "tts_audio.wav"
-            self._generate_tts(translated_entries, tts_audio)
+            self._generate_tts(translated_entries, tts_audio, ffmpeg_path, ffprobe_path)
             self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
         self._step(80, "Rendering output")
-        filters = []
-        if settings.enable_subtitles:
-            subtitle_filter = self._build_subtitle_filter(translated_srt, settings)
-            filters.append(subtitle_filter)
-        if settings.blur_fill:
-            filters.append(self._build_blur_filter(settings))
-
-        filter_complex = ",".join(filters) if filters else None
         render_command = [
             str(ffmpeg_path),
             "-y",
@@ -367,11 +391,18 @@ class WorkerThread(QtCore.QThread):
         ]
         if tts_audio:
             render_command += ["-i", str(tts_audio)]
-        if filter_complex:
-            render_command += ["-vf", filter_complex]
+        video_filter_args = self._build_video_filter_args(translated_srt, settings)
+        render_command += video_filter_args
 
+        has_video_map = "-map" in video_filter_args
         if tts_audio:
-            render_command += ["-map", "0:v", "-map", "1:a"]
+            if not has_video_map:
+                render_command += ["-map", "0:v"]
+            render_command += ["-map", "1:a"]
+        else:
+            if not has_video_map:
+                render_command += ["-map", "0:v"]
+            render_command += ["-map", "0:a?"]
         if settings.mute_original:
             render_command += ["-c:a", "aac", "-b:a", "192k"]
         else:
@@ -438,15 +469,46 @@ class WorkerThread(QtCore.QThread):
             return response.text.strip()
         return text
 
-    def _generate_tts(self, entries: list[dict], output_path: Path):
-        text = "\n".join(entry["text"] for entry in entries)
+    def _generate_tts(
+        self,
+        entries: list[dict],
+        output_path: Path,
+        ffmpeg_path: Path,
+        ffprobe_path: Path,
+    ):
+        segment_paths = []
+        for idx, entry in enumerate(entries, start=1):
+            timestamps = entry["timestamps"].split(" --> ")
+            if len(timestamps) != 2:
+                continue
+            start_time = parse_timestamp(timestamps[0])
+            end_time = parse_timestamp(timestamps[1])
+            max_duration = max(0.1, end_time - start_time)
+            raw_path = output_path.with_name(f"tts_segment_{idx}.wav")
+            self._generate_tts_segment(entry["text"], raw_path, ffmpeg_path)
+            adjusted_path = self._check_and_speed_up_audio(
+                raw_path,
+                max_duration,
+                ffmpeg_path,
+                ffprobe_path,
+            )
+            delay_ms = int(start_time * 1000)
+            segment_paths.append((adjusted_path, delay_ms))
+
+        if not segment_paths:
+            raise RuntimeError("No TTS segments generated.")
+
+        self._mix_segments(segment_paths, output_path, ffmpeg_path)
+
+    def _generate_tts_segment(self, text: str, output_path: Path, ffmpeg_path: Path):
+        temp_output = output_path.with_suffix(".mp3")
         if self.settings.tts_provider == "Edge TTS":
             if edge_tts is None:
                 raise RuntimeError("edge-tts package not installed.")
 
             async def _run():
                 communicate = edge_tts.Communicate(text, self.settings.target_language)
-                await communicate.save(str(output_path))
+                await communicate.save(str(temp_output))
 
             thread = threading.Thread(target=lambda: asyncio.run(_run()), daemon=True)
             thread.start()
@@ -476,8 +538,83 @@ class WorkerThread(QtCore.QThread):
                 raise RuntimeError("Custom API response missing audio URL.")
             audio_response = requests.get(audio_url, timeout=60)
             audio_response.raise_for_status()
-            with open(output_path, "wb") as handle:
+            with open(temp_output, "wb") as handle:
                 handle.write(audio_response.content)
+
+        convert_command = [
+            str(ffmpeg_path),
+            "-y",
+            "-i",
+            str(temp_output),
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            str(output_path),
+        ]
+        if run_subprocess(convert_command, self.log.emit) != 0:
+            raise RuntimeError("TTS audio conversion failed.")
+        if temp_output.exists():
+            temp_output.unlink()
+
+    def _check_and_speed_up_audio(
+        self,
+        file_path: Path,
+        max_duration: float,
+        ffmpeg_path: Path,
+        ffprobe_path: Path,
+    ) -> Path:
+        current_duration = get_audio_duration(file_path, ffprobe_path)
+        if current_duration <= 0 or current_duration <= max_duration:
+            return file_path
+        speed_factor = min(2.0, max(1.0, current_duration / max_duration))
+        adjusted_path = file_path.with_name(f"{file_path.stem}_fast.wav")
+        command = [
+            str(ffmpeg_path),
+            "-y",
+            "-i",
+            str(file_path),
+            "-filter:a",
+            f"atempo={speed_factor}",
+            str(adjusted_path),
+        ]
+        if run_subprocess(command, self.log.emit) != 0:
+            raise RuntimeError("Audio time-stretch failed.")
+        return adjusted_path
+
+    def _mix_segments(
+        self,
+        segment_paths: list[tuple[Path, int]],
+        output_path: Path,
+        ffmpeg_path: Path,
+    ):
+        command = [str(ffmpeg_path), "-y"]
+        filter_parts = []
+        inputs = []
+        for idx, (path, delay_ms) in enumerate(segment_paths):
+            command += ["-i", str(path)]
+            filter_parts.append(f"[{idx}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
+            inputs.append(f"[a{idx}]")
+        if len(inputs) == 1:
+            filter_parts.append(f"{inputs[0]}anull[aout]")
+        else:
+            filter_parts.append(
+                f"{''.join(inputs)}amix=inputs={len(inputs)}:normalize=0[aout]"
+            )
+        filter_complex = ";".join(filter_parts)
+        command += [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[aout]",
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            str(output_path),
+        ]
+        if run_subprocess(command, self.log.emit) != 0:
+            raise RuntimeError("TTS segment mixing failed.")
 
     def _apply_audio_fx(self, audio_path: Path, settings: AppSettings, ffmpeg_path: Path):
         if settings.speed == 1.0 and settings.pitch == 0.0:
@@ -520,6 +657,30 @@ class WorkerThread(QtCore.QThread):
             )
         color = "black"
         return f"drawbox=y=ih*{1 - height_ratio}:h=ih*{height_ratio}:color={color}:t=fill"
+
+    def _build_video_filter_args(self, srt_path: Path, settings: AppSettings) -> list[str]:
+        if not settings.blur_fill:
+            if settings.enable_subtitles:
+                return ["-vf", self._build_subtitle_filter(srt_path, settings)]
+            return []
+
+        height_ratio = max(1, min(100, settings.blur_height)) / 100.0
+        crop_h = f"ih*{height_ratio}"
+        crop_y = f"ih-{crop_h}"
+        blur_filter = self._build_blur_filter(settings)
+        filter_parts = [
+            "[0:v]split[base][orig]",
+            f"[orig]crop=iw:{crop_h}:0:{crop_y}[bottom]",
+            f"[bottom]{blur_filter}[blurred]",
+            "[base][blurred]overlay=0:main_h-overlay_h[blurred_full]",
+        ]
+        if settings.enable_subtitles:
+            subtitle_filter = self._build_subtitle_filter(srt_path, settings)
+            filter_parts.append(f"[blurred_full]{subtitle_filter}[vout]")
+        else:
+            filter_parts.append("[blurred_full]null[vout]")
+        filter_complex = ";".join(filter_parts)
+        return ["-filter_complex", filter_complex, "-map", "[vout]"]
 
 
 class SettingsDialog(QtWidgets.QDialog):
