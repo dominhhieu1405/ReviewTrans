@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -602,12 +603,16 @@ class WorkerThread(QtCore.QThread):
         cache_dir: Path,
         ffmpeg_path: Path,
     ) -> Path:
+        speed_rate = max(0.1, min(1.9, self.settings.speed))
         raw_key = generate_cache_key(
             text,
             self.settings.tts_provider,
             self.settings.target_language,
             self.config.custom_tts_url,
             self.config.custom_tts_key,
+            self.config.vbee_app_id,
+            self.config.vbee_voice_code,
+            speed_rate,
         )
         output_path = cache_dir / f"tts_raw_{raw_key}_{index}.wav"
         if output_path.exists():
@@ -626,6 +631,12 @@ class WorkerThread(QtCore.QThread):
             thread = threading.Thread(target=lambda: asyncio.run(_run()), daemon=True)
             thread.start()
             thread.join()
+        elif self.settings.tts_provider == "vBee TTS":
+            audio_url = self._generate_vbee_tts(text, speed_rate)
+            audio_response = requests.get(audio_url, timeout=60)
+            audio_response.raise_for_status()
+            with open(temp_output, "wb") as handle:
+                handle.write(audio_response.content)
         else:
             if not self.config.custom_tts_url:
                 raise ValueError("Custom API URL is required.")
@@ -670,6 +681,49 @@ class WorkerThread(QtCore.QThread):
         if temp_output.exists():
             temp_output.unlink()
         return output_path
+
+    def _generate_vbee_tts(self, text: str, speed_rate: float) -> str:
+        if not self.config.vbee_app_id or not self.config.vbee_token:
+            raise ValueError("vBee credentials are required.")
+        payload = {
+            "app_id": self.config.vbee_app_id,
+            "response_type": "indirect",
+            "callback": "https://www.k6vn.org/",
+            "input_text": text,
+            "voice_code": self.config.vbee_voice_code,
+            "speed_rate": f"{speed_rate:.2f}",
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.vbee_token}",
+        }
+        response = requests.post(
+            "https://vbee.vn/api/v1/tts",
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") != 1:
+            raise RuntimeError("vBee TTS request failed.")
+        request_id = data.get("result", {}).get("request_id")
+        if not request_id:
+            raise RuntimeError("vBee TTS missing request_id.")
+
+        for _ in range(self.config.vbee_max_retries):
+            time.sleep(1)
+            poll_response = requests.get(
+                f"https://vbee.vn/api/v1/tts/{request_id}",
+                headers={"Authorization": f"Bearer {self.config.vbee_token}"},
+                timeout=30,
+            )
+            poll_response.raise_for_status()
+            poll_data = poll_response.json()
+            audio_link = poll_data.get("result", {}).get("audio_link")
+            if audio_link:
+                return audio_link
+        raise TimeoutError("vBee TTS polling timed out.")
 
     def _build_atempo_chain(self, speed_factor: float) -> str:
         factors = []
@@ -891,6 +945,19 @@ class SettingsDialog(QtWidgets.QDialog):
         self.custom_tts_url_edit.setPlaceholderText("https://example.com/tts")
         tts_layout.addRow("Custom TTS API URL:", self.custom_tts_url_edit)
 
+        self.vbee_app_id_edit = QtWidgets.QLineEdit(self.config.vbee_app_id)
+        self.vbee_token_edit = QtWidgets.QLineEdit(self.config.vbee_token)
+        self.vbee_token_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.vbee_voice_code_edit = QtWidgets.QLineEdit(self.config.vbee_voice_code)
+        self.vbee_max_retries_spin = QtWidgets.QSpinBox()
+        self.vbee_max_retries_spin.setRange(1, 60)
+        self.vbee_max_retries_spin.setValue(self.config.vbee_max_retries)
+
+        tts_layout.addRow("vBee App ID:", self.vbee_app_id_edit)
+        tts_layout.addRow("vBee Token:", self.vbee_token_edit)
+        tts_layout.addRow("vBee Voice Code:", self.vbee_voice_code_edit)
+        tts_layout.addRow("vBee Max Retries:", self.vbee_max_retries_spin)
+
         tabs.addTab(general_tab, "General")
         tabs.addTab(tts_tab, "TTS / Dubbing")
         layout.addWidget(tabs)
@@ -913,6 +980,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.config.gemini_api_key = self.gemini_key_edit.text().strip()
         self.config.custom_tts_key = self.custom_tts_key_edit.text().strip()
         self.config.custom_tts_url = self.custom_tts_url_edit.text().strip()
+        self.config.vbee_app_id = self.vbee_app_id_edit.text().strip()
+        self.config.vbee_token = self.vbee_token_edit.text().strip()
+        self.config.vbee_voice_code = self.vbee_voice_code_edit.text().strip()
+        self.config.vbee_max_retries = self.vbee_max_retries_spin.value()
         self.config.default_output_dir = self.output_dir_edit.text().strip()
         self.config_manager.save()
         self.accept()
@@ -1045,7 +1116,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tts_layout = QtWidgets.QGridLayout(tts_group)
         self.tts_enable_checkbox = QtWidgets.QCheckBox("Enable TTS")
         self.tts_provider_combo = QtWidgets.QComboBox()
-        self.tts_provider_combo.addItems(["Edge TTS", "Custom API"])
+        self.tts_provider_combo.addItems(["Edge TTS", "Custom API", "vBee TTS"])
         self.force_sync_checkbox = QtWidgets.QCheckBox("Force Audio Sync (Fit to Slot)")
         self.force_sync_checkbox.setChecked(True)
         self.force_sync_checkbox.setToolTip(
@@ -1088,7 +1159,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.font_family_combo.addItems(QtGui.QFontDatabase.families())
         self.font_size_spin = QtWidgets.QSpinBox()
         self.font_size_spin.setRange(8, 72)
-        self.font_size_spin.setValue(24)
+        self.font_size_spin.setValue(16)
         self.text_color_button = QtWidgets.QPushButton("Select Color")
         self.text_color_button.clicked.connect(self._select_color)
         self.text_color_display = QtWidgets.QLineEdit("#FFFFFF")
@@ -1159,6 +1230,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_defaults(self):
         self.target_lang_combo.setCurrentText(self.config.default_target_language)
         self.provider_combo.setCurrentText(self.config.default_provider)
+        self.model_combo_provider.setCurrentText("gemini-flash-latest")
         self.tts_provider_combo.setCurrentText(self.config.default_tts_provider)
         self.translate_all_checkbox.setChecked(self.config.default_translate_all)
         self.tts_enable_checkbox.setChecked(self.config.default_enable_tts)
