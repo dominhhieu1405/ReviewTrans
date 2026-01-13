@@ -688,7 +688,7 @@ class WorkerThread(QtCore.QThread):
         payload = {
             "app_id": self.config.vbee_app_id,
             "response_type": "indirect",
-            "callback": "https://www.k6vn.org/",
+            "callbackUrl": "https://www.k6vn.org/",
             "input_text": text,
             "voice_code": self.config.vbee_voice_code,
             "speed_rate": f"{speed_rate:.2f}",
