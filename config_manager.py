@@ -11,14 +11,18 @@ class AppConfig:
     gemini_api_key: str = ""
     custom_tts_key: str = ""
     custom_tts_url: str = ""
+    vbee_app_id: str = ""
+    vbee_token: str = ""
+    vbee_voice_code: str = ""
+    vbee_max_retries: int = 10
     default_output_dir: str = ""
-    default_target_language: str = "en"
-    default_provider: str = "ChatGPT"
+    default_target_language: str = "vi"
+    default_provider: str = "Gemini"
     default_tts_provider: str = "Edge TTS"
     default_translate_all: bool = True
     default_enable_tts: bool = False
     default_enable_subtitles: bool = True
-    default_whisper_language: str = "auto"
+    default_whisper_language: str = "zh"
     extra: dict = field(default_factory=dict)
 
 
@@ -44,14 +48,18 @@ class ConfigManager:
             gemini_api_key=data.get("gemini_api_key", ""),
             custom_tts_key=data.get("custom_tts_key", ""),
             custom_tts_url=data.get("custom_tts_url", ""),
+            vbee_app_id=data.get("vbee_app_id", ""),
+            vbee_token=data.get("vbee_token", ""),
+            vbee_voice_code=data.get("vbee_voice_code", ""),
+            vbee_max_retries=data.get("vbee_max_retries", 10),
             default_output_dir=data.get("default_output_dir", ""),
-            default_target_language=data.get("default_target_language", "en"),
-            default_provider=data.get("default_provider", "ChatGPT"),
+            default_target_language=data.get("default_target_language", "vi"),
+            default_provider=data.get("default_provider", "Gemini"),
             default_tts_provider=data.get("default_tts_provider", "Edge TTS"),
             default_translate_all=data.get("default_translate_all", True),
             default_enable_tts=data.get("default_enable_tts", False),
             default_enable_subtitles=data.get("default_enable_subtitles", True),
-            default_whisper_language=data.get("default_whisper_language", "auto"),
+            default_whisper_language=data.get("default_whisper_language", "zh"),
             extra=data.get("extra", {}),
         )
         return self.config
@@ -62,6 +70,10 @@ class ConfigManager:
             "gemini_api_key": self.config.gemini_api_key,
             "custom_tts_key": self.config.custom_tts_key,
             "custom_tts_url": self.config.custom_tts_url,
+            "vbee_app_id": self.config.vbee_app_id,
+            "vbee_token": self.config.vbee_token,
+            "vbee_voice_code": self.config.vbee_voice_code,
+            "vbee_max_retries": self.config.vbee_max_retries,
             "default_output_dir": self.config.default_output_dir,
             "default_target_language": self.config.default_target_language,
             "default_provider": self.config.default_provider,
