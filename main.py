@@ -520,7 +520,15 @@ class WorkerThread(QtCore.QThread):
 
     def _translate_text(self, text: str, settings: AppSettings) -> str:
         glossary = settings.glossary_instructions.strip()
-        system_instructions = "You are a professional translator."
+        system_instructions = (
+            "You are a professional translator.\n"
+            "CONSTRAINT: You are translating for Movie Dubbing. The translated text must "
+            "be concise and match the spoken duration of the original text as closely as "
+            "possible. Avoid wordy explanations or expansions. Choose shorter synonyms "
+            "where possible. If the source sentence is short (e.g., 'No.'), the target must "
+            "be short (e.g., 'Không.'). Do not make it 'Tôi không đồng ý với điều đó.' "
+            "unless necessary for context."
+        )
         if glossary:
             system_instructions += f"\nAdditional instructions:\n{glossary}"
         prompt = (
@@ -706,19 +714,28 @@ class WorkerThread(QtCore.QThread):
         ffmpeg_path: Path,
         video_duration: float,
     ):
-        command = [str(ffmpeg_path), "-y"]
+        command = [
+            str(ffmpeg_path),
+            "-y",
+            "-f",
+            "lavfi",
+            "-t",
+            f"{max(video_duration, 0.1)}",
+            "-i",
+            "anullsrc=channel_layout=mono:sample_rate=44100",
+        ]
         filter_parts = []
-        inputs = []
+        inputs = ["[0:a]"]
         for idx, (path, delay_ms) in enumerate(segment_paths):
             command += ["-i", str(path)]
-            filter_parts.append(f"[{idx}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
-            inputs.append(f"[a{idx}]")
-        if len(inputs) == 1:
-            filter_parts.append(f"{inputs[0]}anull[aout]")
-        else:
+            input_index = idx + 1
             filter_parts.append(
-                f"{''.join(inputs)}amix=inputs={len(inputs)}:normalize=0[aout]"
+                f"[{input_index}:a]adelay={delay_ms}|{delay_ms}[a{input_index}]"
             )
+            inputs.append(f"[a{input_index}]")
+        filter_parts.append(
+            f"{''.join(inputs)}amix=inputs={len(inputs)}:normalize=0:duration=longest[aout]"
+        )
         filter_complex = ";".join(filter_parts)
         command += [
             "-filter_complex",
