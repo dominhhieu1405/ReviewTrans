@@ -714,57 +714,79 @@ class WorkerThread(QtCore.QThread):
         ffmpeg_path: Path,
         video_duration: float,
     ):
-        command = [
-            str(ffmpeg_path),
-            "-y",
-            "-f",
-            "lavfi",
-            "-t",
-            f"{max(video_duration, 0.1)}",
-            "-i",
-            "anullsrc=channel_layout=mono:sample_rate=44100",
-        ]
-        filter_parts = []
-        inputs = ["[0:a]"]
-        for idx, (path, delay_ms) in enumerate(segment_paths):
-            command += ["-i", str(path)]
-            input_index = idx + 1
-            filter_parts.append(
-                f"[{input_index}:a]adelay={delay_ms}|{delay_ms}[a{input_index}]"
-            )
-            inputs.append(f"[a{input_index}]")
-        filter_parts.append(
-            f"{''.join(inputs)}amix=inputs={len(inputs)}:normalize=0:duration=longest[aout]"
-        )
-        filter_complex = ";".join(filter_parts)
-        command += [
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[aout]",
-            "-ac",
-            "1",
-            "-ar",
-            "44100",
-            str(output_path),
-        ]
-        if run_subprocess(command, self.log.emit) != 0:
-            raise RuntimeError("TTS segment mixing failed.")
+        batch_size = 20
+        temp_files: list[Path] = []
+        base_audio = output_path.with_name("base_accumulator.wav")
+        temp_mix = output_path.with_name("temp_mix.wav")
+        try:
+            base_command = [
+                str(ffmpeg_path),
+                "-y",
+                "-f",
+                "lavfi",
+                "-t",
+                f"{max(video_duration, 0.1)}",
+                "-i",
+                "anullsrc=channel_layout=mono:sample_rate=44100",
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                str(base_audio),
+            ]
+            if run_subprocess(base_command, self.log.emit) != 0:
+                raise RuntimeError("Base audio generation failed.")
+            temp_files.append(base_audio)
 
-        if video_duration > 0:
-            trimmed_output = output_path.with_name(f"{output_path.stem}_dur.wav")
-            trim_command = [
+            for start in range(0, len(segment_paths), batch_size):
+                batch = segment_paths[start : start + batch_size]
+                command = [str(ffmpeg_path), "-y", "-i", str(base_audio)]
+                filter_parts = []
+                inputs = ["[0:a]"]
+                for idx, (path, delay_ms) in enumerate(batch):
+                    command += ["-i", str(path)]
+                    input_index = idx + 1
+                    filter_parts.append(
+                        f"[{input_index}:a]adelay={delay_ms}|{delay_ms}[a{input_index}]"
+                    )
+                    inputs.append(f"[a{input_index}]")
+                filter_parts.append(
+                    f"{''.join(inputs)}amix=inputs={len(inputs)}:"
+                    "duration=first:dropout_transition=0:normalize=0[aout]"
+                )
+                filter_complex = ";".join(filter_parts)
+                command += [
+                    "-filter_complex",
+                    filter_complex,
+                    "-map",
+                    "[aout]",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "44100",
+                    str(temp_mix),
+                ]
+                if run_subprocess(command, self.log.emit) != 0:
+                    raise RuntimeError("TTS segment mixing failed.")
+                shutil.move(temp_mix, base_audio)
+
+            final_command = [
                 str(ffmpeg_path),
                 "-y",
                 "-i",
+                str(base_audio),
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
                 str(output_path),
-                "-filter:a",
-                f"apad=pad_dur={video_duration},atrim=0:{video_duration}",
-                str(trimmed_output),
             ]
-            if run_subprocess(trim_command, self.log.emit) != 0:
-                raise RuntimeError("Audio duration trim failed.")
-            shutil.move(trimmed_output, output_path)
+            if run_subprocess(final_command, self.log.emit) != 0:
+                raise RuntimeError("Final audio export failed.")
+        finally:
+            for temp_file in temp_files + [temp_mix]:
+                if temp_file.exists():
+                    temp_file.unlink()
 
     def _apply_audio_fx(self, audio_path: Path, settings: AppSettings, ffmpeg_path: Path):
         if settings.speed == 1.0 and settings.pitch == 0.0:
