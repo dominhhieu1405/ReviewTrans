@@ -15,7 +15,6 @@ class AppConfig:
     vbee_token: str = ""
     vbee_voice_code: str = ""
     vbee_max_retries: int = 10
-    default_output_dir: str = ""
     default_target_language: str = "vi"
     default_provider: str = "Gemini"
     default_tts_provider: str = "Edge TTS"
@@ -23,6 +22,7 @@ class AppConfig:
     default_enable_tts: bool = False
     default_enable_subtitles: bool = True
     default_whisper_language: str = "zh"
+    last_opened_directory: str = ""
     extra: dict = field(default_factory=dict)
 
 
@@ -52,7 +52,6 @@ class ConfigManager:
             vbee_token=data.get("vbee_token", ""),
             vbee_voice_code=data.get("vbee_voice_code", ""),
             vbee_max_retries=data.get("vbee_max_retries", 10),
-            default_output_dir=data.get("default_output_dir", ""),
             default_target_language=data.get("default_target_language", "vi"),
             default_provider=data.get("default_provider", "Gemini"),
             default_tts_provider=data.get("default_tts_provider", "Edge TTS"),
@@ -60,6 +59,7 @@ class ConfigManager:
             default_enable_tts=data.get("default_enable_tts", False),
             default_enable_subtitles=data.get("default_enable_subtitles", True),
             default_whisper_language=data.get("default_whisper_language", "zh"),
+            last_opened_directory=data.get("last_opened_directory", ""),
             extra=data.get("extra", {}),
         )
         return self.config
@@ -74,7 +74,6 @@ class ConfigManager:
             "vbee_token": self.config.vbee_token,
             "vbee_voice_code": self.config.vbee_voice_code,
             "vbee_max_retries": self.config.vbee_max_retries,
-            "default_output_dir": self.config.default_output_dir,
             "default_target_language": self.config.default_target_language,
             "default_provider": self.config.default_provider,
             "default_tts_provider": self.config.default_tts_provider,
@@ -82,6 +81,7 @@ class ConfigManager:
             "default_enable_tts": self.config.default_enable_tts,
             "default_enable_subtitles": self.config.default_enable_subtitles,
             "default_whisper_language": self.config.default_whisper_language,
+            "last_opened_directory": self.config.last_opened_directory,
             "extra": self.config.extra,
         }
         with self.config_path.open("w", encoding="utf-8") as handle:

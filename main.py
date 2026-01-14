@@ -186,6 +186,34 @@ def get_video_duration(path: Path, ffprobe_path: Path) -> float:
         return 0.0
 
 
+def get_video_height(path: Path, ffprobe_path: Path) -> int:
+    command = [
+        str(ffprobe_path),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=height",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    try:
+        return int(process.stdout.strip())
+    except ValueError:
+        return 0
+
+
 def fetch_whisper_models(log_cb=None) -> list[str]:
     url = f"https://huggingface.co/api/models/{WHISPER_REPO}"
     if log_cb:
@@ -377,9 +405,10 @@ class WorkerThread(QtCore.QThread):
             if not whisper_path:
                 raise FileNotFoundError("whisper executable not found in bin/ or tools/ folder.")
             video_path = Path(settings.video_path)
-            video_mtime = video_path.stat().st_mtime
-            asr_key = generate_cache_key(video_path, video_mtime, settings.whisper_model)
-            cached_asr = cache_dir / f"asr_{asr_key}.srt"
+            video_stem = video_path.stem
+            cached_asr = cache_dir / (
+                f"asr_{video_stem}_{settings.whisper_model}_{settings.source_language}.srt"
+            )
             if cached_asr.exists():
                 self.log.emit("Restored ASR from cache.")
                 srt_path = cached_asr
@@ -416,14 +445,10 @@ class WorkerThread(QtCore.QThread):
             source_content = handle.read()
         entries = parse_srt(source_content)
 
-        trans_key = generate_cache_key(
-            source_content,
-            settings.target_language,
-            settings.provider,
-            settings.provider_model,
-            settings.glossary_instructions,
+        video_stem = Path(settings.video_path).stem
+        translated_srt = cache_dir / (
+            f"trans_{video_stem}_{settings.provider_model}_{settings.target_language}.srt"
         )
-        translated_srt = cache_dir / f"trans_{trans_key}.srt"
         if translated_srt.exists():
             self.log.emit("Restored translation from cache.")
             with open(translated_srt, "r", encoding="utf-8", errors="replace") as handle:
@@ -462,6 +487,7 @@ class WorkerThread(QtCore.QThread):
                 self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
         self._step(80, "Rendering output")
+        video_height = get_video_height(Path(settings.video_path), ffprobe_path)
         render_command = [
             str(ffmpeg_path),
             "-y",
@@ -470,7 +496,11 @@ class WorkerThread(QtCore.QThread):
         ]
         if tts_audio:
             render_command += ["-i", str(tts_audio)]
-        video_filter_args = self._build_video_filter_args(translated_srt, settings)
+        video_filter_args = self._build_video_filter_args(
+            translated_srt,
+            settings,
+            video_height,
+        )
         render_command += video_filter_args
 
         has_video_map = "-map" in video_filter_args
@@ -488,7 +518,8 @@ class WorkerThread(QtCore.QThread):
             duck_volume = max(0.1, settings.duck_audio / 100.0)
             render_command += ["-filter:a", f"volume={duck_volume}"]
 
-        output_dir = Path(settings.output_dir or work_dir)
+        video_dir = Path(settings.video_path).parent
+        output_dir = video_dir / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{Path(settings.video_path).stem}_translated.mp4"
         render_command.append(str(output_path))
@@ -528,7 +559,11 @@ class WorkerThread(QtCore.QThread):
             "possible. Avoid wordy explanations or expansions. Choose shorter synonyms "
             "where possible. If the source sentence is short (e.g., 'No.'), the target must "
             "be short (e.g., 'Không.'). Do not make it 'Tôi không đồng ý với điều đó.' "
-            "unless necessary for context."
+            "unless necessary for context.\n"
+            "RULE: If a sentence translates to a single word (e.g., 'Không', 'Được'), you "
+            "MUST merge it into the previous or next sentence, whichever fits the context "
+            "better. Ensure every translated segment has at least 2 words or is "
+            "grammatically complete."
         )
         if glossary:
             system_instructions += f"\nAdditional instructions:\n{glossary}"
@@ -688,7 +723,7 @@ class WorkerThread(QtCore.QThread):
         payload = {
             "app_id": self.config.vbee_app_id,
             "response_type": "indirect",
-            "callback": "https://www.k6vn.org/",
+            "callbackUrl": "https://www.k6vn.org/",
             "input_text": text,
             "voice_code": self.config.vbee_voice_code,
             "speed_rate": f"{speed_rate:.2f}",
@@ -862,45 +897,60 @@ class WorkerThread(QtCore.QThread):
             raise RuntimeError("Audio post-processing failed.")
         shutil.move(fx_output, audio_path)
 
-    def _build_subtitle_filter(self, srt_path: Path, settings: AppSettings) -> str:
+    def _build_subtitle_filter(
+        self,
+        srt_path: Path,
+        settings: AppSettings,
+        margin_v: int,
+    ) -> str:
         alignment = {"Bottom": "2", "Center": "5", "Top": "8"}.get(settings.position, "2")
         style = (
             f"FontName={settings.font_family},"
             f"FontSize={settings.font_size},"
             f"PrimaryColour=&H{settings.text_color.lstrip('#')},"
             f"Outline={settings.border_width},"
-            f"Alignment={alignment}"
+            f"Alignment={alignment},"
+            f"MarginV={margin_v}"
         )
         safe_path = escape_ffmpeg_path(str(srt_path))
         return f"subtitles='{safe_path}':force_style='{style}'"
 
     def _build_blur_filter(self, settings: AppSettings) -> str:
-        height_ratio = max(1, min(100, settings.blur_height)) / 100.0
         if settings.blur_mode == "Blur":
             return (
                 "boxblur=luma_radius=10:luma_power=1:"
                 "chroma_radius=10:chroma_power=1"
             )
         color = "black"
-        return f"drawbox=y=ih*{1 - height_ratio}:h=ih*{height_ratio}:color={color}:t=fill"
+        return f"drawbox=y=0:h=ih:color={color}:t=fill"
 
-    def _build_video_filter_args(self, srt_path: Path, settings: AppSettings) -> list[str]:
+    def _build_video_filter_args(
+        self,
+        srt_path: Path,
+        settings: AppSettings,
+        video_height: int,
+    ) -> list[str]:
+        margin_v = int(video_height * 0.05) if video_height > 0 else 0
         if not settings.blur_fill:
             if settings.enable_subtitles:
-                return ["-vf", self._build_subtitle_filter(srt_path, settings)]
+                return [
+                    "-vf",
+                    self._build_subtitle_filter(srt_path, settings, margin_v),
+                ]
             return []
 
-        height_ratio = max(1, min(100, settings.blur_height)) / 100.0
+        height_ratio = min(0.95, max(0.01, settings.blur_height / 100.0))
+        margin_ratio = 0.05
         crop_h = f"ih*{height_ratio}"
-        crop_y = f"ih-{crop_h}"
+        crop_y = f"ih*{1 - margin_ratio - height_ratio}"
         blur_filter = self._build_blur_filter(settings)
         filter_parts = [
             f"[0:v]crop=iw:{crop_h}:0:{crop_y}[bottom]",
             f"[bottom]{blur_filter}[blurred]",
-            "[0:v][blurred]overlay=0:main_h-overlay_h[bg_processed]",
+            f"[0:v][blurred]overlay=0:main_h*{1 - margin_ratio - height_ratio}[bg_processed]",
         ]
         if settings.enable_subtitles:
-            subtitle_filter = self._build_subtitle_filter(srt_path, settings)
+            subtitle_filter = self._build_subtitle_filter(srt_path, settings, margin_v)
             filter_parts.append(f"[bg_processed]{subtitle_filter}[vout]")
         else:
             filter_parts.append("[bg_processed]null[vout]")
@@ -927,17 +977,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.gemini_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.custom_tts_key_edit = QtWidgets.QLineEdit(self.config.custom_tts_key)
         self.custom_tts_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self.output_dir_edit = QtWidgets.QLineEdit(self.config.default_output_dir)
-        output_button = QtWidgets.QPushButton("Browse")
-        output_button.clicked.connect(self._browse_output_dir)
-        output_layout = QtWidgets.QHBoxLayout()
-        output_layout.addWidget(self.output_dir_edit)
-        output_layout.addWidget(output_button)
-
         general_layout.addRow("OpenAI API Key:", self.openai_key_edit)
         general_layout.addRow("Gemini API Key:", self.gemini_key_edit)
         general_layout.addRow("Custom TTS Key:", self.custom_tts_key_edit)
-        general_layout.addRow("Default Output Folder:", output_layout)
 
         tts_tab = QtWidgets.QWidget()
         tts_layout = QtWidgets.QFormLayout(tts_tab)
@@ -970,11 +1012,6 @@ class SettingsDialog(QtWidgets.QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
-    def _browse_output_dir(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder")
-        if path:
-            self.output_dir_edit.setText(path)
-
     def _save(self):
         self.config.openai_api_key = self.openai_key_edit.text().strip()
         self.config.gemini_api_key = self.gemini_key_edit.text().strip()
@@ -984,7 +1021,6 @@ class SettingsDialog(QtWidgets.QDialog):
         self.config.vbee_token = self.vbee_token_edit.text().strip()
         self.config.vbee_voice_code = self.vbee_voice_code_edit.text().strip()
         self.config.vbee_max_retries = self.vbee_max_retries_spin.value()
-        self.config.default_output_dir = self.output_dir_edit.text().strip()
         self.config_manager.save()
         self.accept()
 
@@ -1017,6 +1053,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_provider_models()
         self._load_defaults()
         self._fetch_models_async()
+        self._init_timer()
 
     def _build_menu(self):
         menu = self.menuBar().addMenu("Settings")
@@ -1089,7 +1126,7 @@ class MainWindow(QtWidgets.QMainWindow):
         translation_layout = QtWidgets.QGridLayout(translation_group)
 
         self.provider_combo = QtWidgets.QComboBox()
-        self.provider_combo.addItems(["ChatGPT", "Gemini"])
+        self.provider_combo.addItems(["Gemini", "ChatGPT"])
         self.provider_combo.currentTextChanged.connect(self._update_provider_models)
         self.model_combo_provider = QtWidgets.QComboBox()
         self.target_lang_combo = QtWidgets.QComboBox()
@@ -1191,6 +1228,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.duck_input.setRange(0, 100)
         self.duck_input.setValue(30)
         self.blur_checkbox = QtWidgets.QCheckBox("Blur/Fill Bottom")
+        self.blur_checkbox.setChecked(True)
         self.blur_height_spin = QtWidgets.QSpinBox()
         self.blur_height_spin.setRange(5, 50)
         self.blur_height_spin.setValue(20)
@@ -1214,12 +1252,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_button.clicked.connect(self._start_processing)
         self.progress_bar = QtWidgets.QProgressBar()
         self.status_label = QtWidgets.QLabel("Idle")
+        self.processing_time_label = QtWidgets.QLabel("Processing Time: 00:00")
         self.log_console = QtWidgets.QTextEdit()
         self.log_console.setReadOnly(True)
 
         execution_layout.addWidget(self.start_button)
         execution_layout.addWidget(self.progress_bar)
         execution_layout.addWidget(self.status_label)
+        execution_layout.addWidget(self.processing_time_label)
         execution_layout.addWidget(self.log_console)
 
         layout.addWidget(subtitle_group)
@@ -1274,17 +1314,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if provider == "ChatGPT":
             self.model_combo_provider.addItems(OPENAI_MODELS)
         else:
-            self.model_combo_provider.addItems(GEMINI_MODELS)
+            self.model_combo_provider.addItems(
+                ["gemini-flash-latest"]
+                + [model for model in GEMINI_MODELS if model != "gemini-flash-latest"]
+            )
 
     def _browse_video(self):
+        start_dir = self.config.last_opened_directory or ""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Video",
-            "",
+            start_dir,
             f"Video Files ({SUPPORTED_VIDEO_EXTENSIONS})",
         )
         if path:
             self.video_path_edit.setText(path)
+            self.config.last_opened_directory = str(Path(path).parent)
+            self.config_manager.save()
 
     def _browse_srt(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1341,7 +1387,7 @@ class MainWindow(QtWidgets.QMainWindow):
             blur_height=self.blur_height_spin.value(),
             blur_mode=self.blur_mode_combo.currentText(),
             cuda=self.cuda_checkbox.isChecked(),
-            output_dir=self.config.default_output_dir,
+            output_dir="",
         )
 
         self.worker = WorkerThread(settings, self.config)
@@ -1350,15 +1396,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.log.connect(self.log_console.append)
         self.worker.finished.connect(self._handle_finished)
         self.worker.failed.connect(self._handle_failed)
+        self.worker.started.connect(self._start_timer)
         self.worker.start()
 
     def _handle_finished(self, output_path: str):
         self.status_label.setText("Done")
+        self._stop_timer()
         QtWidgets.QMessageBox.information(self, "Completed", f"Output saved to {output_path}")
 
     def _handle_failed(self, error: str):
         self.status_label.setText("Failed")
+        self._stop_timer()
         QtWidgets.QMessageBox.critical(self, "Error", error)
+
+    def _init_timer(self):
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick_timer)
+        self._elapsed_seconds = 0
+
+    def _start_timer(self):
+        self._elapsed_seconds = 0
+        self.processing_time_label.setText("Processing Time: 00:00")
+        self._timer.start()
+
+    def _tick_timer(self):
+        self._elapsed_seconds += 1
+        minutes, seconds = divmod(self._elapsed_seconds, 60)
+        self.processing_time_label.setText(f"Processing Time: {minutes:02d}:{seconds:02d}")
+
+    def _stop_timer(self):
+        self._timer.stop()
 
 
 def main():
