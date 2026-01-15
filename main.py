@@ -404,6 +404,10 @@ class WorkerThread(QtCore.QThread):
             raise ValueError("Video path is required.")
 
         work_dir = Path(tempfile.mkdtemp(prefix="video_trans_"))
+        video_path = Path(settings.video_path)
+        video_stem = video_path.stem
+        output_dir = Path(settings.output_dir) if settings.output_dir else video_path.parent / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
         self.log.emit(f"Working directory: {work_dir}")
         cache_dir = get_resource_path("tmp")
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -441,14 +445,13 @@ class WorkerThread(QtCore.QThread):
             whisper_path = find_tool("whisper")
             if not whisper_path:
                 raise FileNotFoundError("whisper executable not found in bin/ or tools/ folder.")
-            video_path = Path(settings.video_path)
-            video_stem = video_path.stem
             cached_asr = cache_dir / (
                 f"asr_{video_stem}_{settings.whisper_model}_{settings.source_language}.srt"
             )
             if cached_asr.exists():
                 self.log.emit("Restored ASR from cache.")
                 srt_path = cached_asr
+                shutil.copy2(cached_asr, output_dir / f"asr_{video_stem}.srt")
             else:
                 models_dir = Path.home() / ".video_translation_studio" / "models"
                 model_path = ensure_whisper_model(
@@ -473,6 +476,7 @@ class WorkerThread(QtCore.QThread):
                     self._check_stop()
                     raise RuntimeError("Whisper ASR failed.")
                 shutil.copy2(srt_path, cached_asr)
+                shutil.copy2(srt_path, output_dir / f"asr_{video_stem}.srt")
         else:
             if not settings.srt_path:
                 raise ValueError("SRT path is required when using SRT mode.")
@@ -484,7 +488,6 @@ class WorkerThread(QtCore.QThread):
             source_content = handle.read()
         entries = parse_srt(source_content)
 
-        video_stem = Path(settings.video_path).stem
         translated_srt = cache_dir / (
             f"trans_{video_stem}_{settings.provider_model}_{settings.target_language}.srt"
         )
@@ -496,6 +499,11 @@ class WorkerThread(QtCore.QThread):
             translated_entries = self._translate_entries(entries, settings)
             with open(translated_srt, "w", encoding="utf-8", errors="replace") as handle:
                 handle.write(render_srt(translated_entries))
+        translated_output = output_dir / f"trans_{video_stem}.srt"
+        final_subtitle_output = output_dir / f"sub_{video_stem}.srt"
+        translated_content = render_srt(translated_entries)
+        translated_output.write_text(translated_content, encoding="utf-8")
+        final_subtitle_output.write_text(translated_content, encoding="utf-8")
 
         tts_audio = None
         if settings.enable_tts:
@@ -525,10 +533,11 @@ class WorkerThread(QtCore.QThread):
                     settings.force_audio_sync,
                 )
                 self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
+            shutil.copy2(tts_audio, output_dir / f"dub_{video_stem}.wav")
 
         self._step(80, "Rendering output")
         self._check_stop()
-        video_height = get_video_height(Path(settings.video_path), ffprobe_path)
+        video_height = get_video_height(video_path, ffprobe_path)
         watermark_paths = self._collect_watermark_paths(settings)
         render_command = [str(ffmpeg_path), "-y", "-i", settings.video_path]
         for watermark, _position in watermark_paths:
@@ -536,7 +545,7 @@ class WorkerThread(QtCore.QThread):
         if tts_audio:
             render_command += ["-i", str(tts_audio)]
         video_filter_args = self._build_video_filter_args(
-            translated_srt,
+            final_subtitle_output,
             settings,
             video_height,
             watermark_paths,
@@ -559,10 +568,7 @@ class WorkerThread(QtCore.QThread):
             duck_volume = max(0.1, settings.duck_audio / 100.0)
             render_command += ["-filter:a", f"volume={duck_volume}"]
 
-        video_dir = Path(settings.video_path).parent
-        output_dir = video_dir / "output"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{Path(settings.video_path).stem}_translated.mp4"
+        output_path = output_dir / f"final_{video_stem}.mp4"
         render_command.append(str(output_path))
         if run_subprocess(render_command, self.log.emit, self._stop_event) != 0:
             self._check_stop()
@@ -1191,11 +1197,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setPalette(palette)
 
     def _build_left_column(self):
-        self.left_column_group = QtWidgets.QGroupBox("Column 1: Configuration")
+        self.left_column_group = QtWidgets.QGroupBox("Column 1: Source & Translation")
         layout = QtWidgets.QVBoxLayout(self.left_column_group)
         layout.addWidget(self._build_video_source_group())
         layout.addWidget(self._build_asr_trans_group())
-        layout.addWidget(self._build_dubbing_watermark_group())
         layout.addStretch()
         return self.left_column_group
 
@@ -1372,10 +1377,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.dubbing_group
 
     def _build_center_column(self):
-        self.center_column_group = QtWidgets.QGroupBox("Column 2: Visuals")
+        self.center_column_group = QtWidgets.QGroupBox("Column 2: Visuals & Audio")
         layout = QtWidgets.QVBoxLayout(self.center_column_group)
+        layout.addWidget(self._build_dubbing_watermark_group())
         layout.addWidget(self._build_subtitle_group())
-        layout.addWidget(self._build_preview_group())
         layout.addStretch()
         return self.center_column_group
 
@@ -1426,8 +1431,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.preview_group
 
     def _build_right_column(self):
-        self.right_column_group = QtWidgets.QGroupBox("Column 3: Monitor")
+        self.right_column_group = QtWidgets.QGroupBox("Column 3: Preview & Status")
         layout = QtWidgets.QVBoxLayout(self.right_column_group)
+        layout.addWidget(self._build_preview_group())
         layout.addWidget(self._build_execution_group())
         return self.right_column_group
 
@@ -1559,8 +1565,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to clear temp files: {exc}")
 
     def _build_settings(self) -> AppSettings:
+        video_path = self.video_path_edit.text().strip()
+        output_dir = str(Path(video_path).parent / "output") if video_path else ""
         return AppSettings(
-            video_path=self.video_path_edit.text().strip(),
+            video_path=video_path,
             source_mode="ASR" if self.asr_radio.isChecked() else "SRT",
             whisper_model=self.model_combo.currentText(),
             source_language=self.source_lang_combo.currentText(),
@@ -1591,7 +1599,7 @@ class MainWindow(QtWidgets.QMainWindow):
             watermark_top_left=self.watermark_top_left_edit.text().strip(),
             watermark_top_right=self.watermark_top_right_edit.text().strip(),
             flip_horizontal=self.flip_checkbox.isChecked(),
-            output_dir="",
+            output_dir=output_dir,
         )
 
     def _collect_watermark_paths(self) -> list[tuple[Path, str]]:
