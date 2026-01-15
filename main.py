@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
-import json
 import platform
 import shutil
 import subprocess
@@ -115,7 +114,7 @@ def download_ffmpeg(os_name: str, log_cb=None) -> Path:
     return bin_dir
 
 
-def run_subprocess(command: list[str], log_cb=None, stop_event: threading.Event | None = None) -> int:
+def run_subprocess(command: list[str], log_cb=None) -> int:
     if log_cb:
         log_cb(f"Running: {' '.join(command)}")
     process = subprocess.Popen(
@@ -126,32 +125,11 @@ def run_subprocess(command: list[str], log_cb=None, stop_event: threading.Event 
         encoding="utf-8",
         errors="replace",
     )
-    stop_watcher = None
-    if stop_event is not None:
-        stop_watcher = threading.Thread(
-            target=_terminate_on_stop,
-            args=(process, stop_event),
-            daemon=True,
-        )
-        stop_watcher.start()
     if process.stdout:
         for line in process.stdout:
             if log_cb:
                 log_cb(line.rstrip())
-    return_code = process.wait()
-    if stop_event is not None and stop_event.is_set():
-        return 1
-    return return_code
-
-
-def _terminate_on_stop(process: subprocess.Popen, stop_event: threading.Event) -> None:
-    stop_event.wait()
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
+    return process.wait()
 
 
 def get_audio_duration(path: Path, ffprobe_path: Path) -> float:
@@ -364,17 +342,12 @@ class DependencyDownloadThread(QtCore.QThread):
             self.failed.emit(str(exc))
 
 
-class StopProcessing(Exception):
-    pass
-
-
 class WorkerThread(QtCore.QThread):
     progress = QtCore.pyqtSignal(int)
     status = QtCore.pyqtSignal(str)
     log = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
-    stopped = QtCore.pyqtSignal()
 
     def __init__(self, settings: AppSettings, config: AppConfig, parent=None):
         super().__init__(parent)
@@ -388,14 +361,11 @@ class WorkerThread(QtCore.QThread):
     def run(self):
         try:
             self._run_pipeline()
-        except StopProcessing:
-            self.stopped.emit()
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
     def _run_pipeline(self):
         settings = self.settings
-        self._check_stop()
         if not settings.video_path:
             raise ValueError("Video path is required.")
 
@@ -410,7 +380,6 @@ class WorkerThread(QtCore.QThread):
 
         audio_path = work_dir / "audio.wav"
         self._step(5, "Extracting audio")
-        self._check_stop()
         extract_command = [
             str(ffmpeg_path),
             "-y",
@@ -426,14 +395,12 @@ class WorkerThread(QtCore.QThread):
         if settings.cuda:
             extract_command.insert(1, "-hwaccel")
             extract_command.insert(2, "cuda")
-        if run_subprocess(extract_command, self.log.emit, self._stop_event) != 0:
-            self._check_stop()
+        if run_subprocess(extract_command, self.log.emit) != 0:
             raise RuntimeError("FFmpeg audio extraction failed.")
 
         srt_path = None
         if settings.source_mode == "ASR":
             self._step(20, "Running ASR")
-            self._check_stop()
             whisper_path = find_tool("whisper")
             if not whisper_path:
                 raise FileNotFoundError("whisper executable not found in bin/ or tools/ folder.")
@@ -465,8 +432,7 @@ class WorkerThread(QtCore.QThread):
                     "-of",
                     str(work_dir / "transcript"),
                 ]
-                if run_subprocess(whisper_command, self.log.emit, self._stop_event) != 0:
-                    self._check_stop()
+                if run_subprocess(whisper_command, self.log.emit) != 0:
                     raise RuntimeError("Whisper ASR failed.")
                 shutil.copy2(srt_path, cached_asr)
         else:
@@ -475,7 +441,6 @@ class WorkerThread(QtCore.QThread):
             srt_path = Path(settings.srt_path)
 
         self._step(40, "Translating subtitles")
-        self._check_stop()
         with open(srt_path, "r", encoding="utf-8", errors="replace") as handle:
             source_content = handle.read()
         entries = parse_srt(source_content)
@@ -496,7 +461,6 @@ class WorkerThread(QtCore.QThread):
         tts_audio = None
         if settings.enable_tts:
             self._step(60, "Generating TTS")
-            self._check_stop()
             translated_text = "\n".join(entry["text"] for entry in translated_entries)
             tts_key = generate_cache_key(
                 translated_text,
@@ -523,7 +487,6 @@ class WorkerThread(QtCore.QThread):
                 self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
         self._step(80, "Rendering output")
-        self._check_stop()
         video_height = get_video_height(Path(settings.video_path), ffprobe_path)
         render_command = [
             str(ffmpeg_path),
@@ -560,21 +523,15 @@ class WorkerThread(QtCore.QThread):
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{Path(settings.video_path).stem}_translated.mp4"
         render_command.append(str(output_path))
-        if run_subprocess(render_command, self.log.emit, self._stop_event) != 0:
-            self._check_stop()
+        if run_subprocess(render_command, self.log.emit) != 0:
             raise RuntimeError("Video rendering failed.")
 
         self._step(100, "Completed")
         self.finished.emit(str(output_path))
 
     def _step(self, value: int, message: str):
-        self._check_stop()
         self.progress.emit(value)
         self.status.emit(message)
-
-    def _check_stop(self):
-        if self._stop_event.is_set():
-            raise StopProcessing
 
     def _translate_entries(self, entries: list[dict], settings: AppSettings) -> list[dict]:
         if settings.provider == "ChatGPT" and openai is None:
@@ -583,7 +540,6 @@ class WorkerThread(QtCore.QThread):
             raise RuntimeError("google-genai package not installed.")
 
         if settings.translate_all:
-            self._check_stop()
             combined_text = "\n".join(entry["text"] for entry in entries)
             translated_text = self._translate_text(combined_text, settings)
             translated_lines = translated_text.splitlines()
@@ -591,7 +547,6 @@ class WorkerThread(QtCore.QThread):
                 entry["text"] = translated_lines[idx] if idx < len(translated_lines) else entry["text"]
         else:
             for entry in entries:
-                self._check_stop()
                 entry["text"] = self._translate_text(entry["text"], settings)
         return entries
 
@@ -648,7 +603,6 @@ class WorkerThread(QtCore.QThread):
     ):
         segment_paths = []
         for idx, entry in enumerate(entries, start=1):
-            self._check_stop()
             timestamps = entry["timestamps"].split(" --> ")
             if len(timestamps) != 2:
                 continue
@@ -757,8 +711,7 @@ class WorkerThread(QtCore.QThread):
             "44100",
             str(output_path),
         ]
-        if run_subprocess(convert_command, self.log.emit, self._stop_event) != 0:
-            self._check_stop()
+        if run_subprocess(convert_command, self.log.emit) != 0:
             raise RuntimeError("TTS audio conversion failed.")
         if temp_output.exists():
             temp_output.unlink()
@@ -794,7 +747,6 @@ class WorkerThread(QtCore.QThread):
             raise RuntimeError("vBee TTS missing request_id.")
 
         for _ in range(self.config.vbee_max_retries):
-            self._check_stop()
             time.sleep(1)
             poll_response = requests.get(
                 f"https://vbee.vn/api/v1/tts/{request_id}",
@@ -840,8 +792,7 @@ class WorkerThread(QtCore.QThread):
             filter_chain,
             str(adjusted_path),
         ]
-        if run_subprocess(command, self.log.emit, self._stop_event) != 0:
-            self._check_stop()
+        if run_subprocess(command, self.log.emit) != 0:
             raise RuntimeError("Audio time-stretch failed.")
         return adjusted_path
 
@@ -872,13 +823,11 @@ class WorkerThread(QtCore.QThread):
                 "44100",
                 str(base_audio),
             ]
-            if run_subprocess(base_command, self.log.emit, self._stop_event) != 0:
-                self._check_stop()
+            if run_subprocess(base_command, self.log.emit) != 0:
                 raise RuntimeError("Base audio generation failed.")
             temp_files.append(base_audio)
 
             for start in range(0, len(segment_paths), batch_size):
-                self._check_stop()
                 batch = segment_paths[start : start + batch_size]
                 command = [str(ffmpeg_path), "-y", "-i", str(base_audio)]
                 filter_parts = []
@@ -906,8 +855,7 @@ class WorkerThread(QtCore.QThread):
                     "44100",
                     str(temp_mix),
                 ]
-                if run_subprocess(command, self.log.emit, self._stop_event) != 0:
-                    self._check_stop()
+                if run_subprocess(command, self.log.emit) != 0:
                     raise RuntimeError("TTS segment mixing failed.")
                 shutil.move(temp_mix, base_audio)
 
@@ -922,8 +870,7 @@ class WorkerThread(QtCore.QThread):
                 "44100",
                 str(output_path),
             ]
-            if run_subprocess(final_command, self.log.emit, self._stop_event) != 0:
-                self._check_stop()
+            if run_subprocess(final_command, self.log.emit) != 0:
                 raise RuntimeError("Final audio export failed.")
         finally:
             for temp_file in temp_files + [temp_mix]:
@@ -946,8 +893,7 @@ class WorkerThread(QtCore.QThread):
             filter_chain,
             str(fx_output),
         ]
-        if run_subprocess(command, self.log.emit, self._stop_event) != 0:
-            self._check_stop()
+        if run_subprocess(command, self.log.emit) != 0:
             raise RuntimeError("Audio post-processing failed.")
         shutil.move(fx_output, audio_path)
 
@@ -1088,8 +1034,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config = config_manager.config
         self.worker = None
         self.model_fetch_thread = None
-        self._session_state = None
-        self._user_stop_requested = False
 
         self._build_menu()
         self._apply_theme()
@@ -1108,15 +1052,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_source_mode()
         self._update_provider_models()
         self._load_defaults()
-        self.load_session_state()
         self._fetch_models_async()
         self._init_timer()
 
     def _build_menu(self):
         menu = self.menuBar().addMenu("Settings")
-        self.settings_action = QtGui.QAction("Preferences", self)
-        self.settings_action.triggered.connect(self._open_settings)
-        menu.addAction(self.settings_action)
+        settings_action = QtGui.QAction("Preferences", self)
+        settings_action.triggered.connect(self._open_settings)
+        menu.addAction(settings_action)
 
     def _apply_theme(self):
         palette = QtGui.QPalette()
@@ -1132,16 +1075,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setPalette(palette)
 
     def _build_input_column(self):
-        self.input_group = QtWidgets.QGroupBox("Column 1: Input")
-        layout = QtWidgets.QVBoxLayout(self.input_group)
+        group = QtWidgets.QGroupBox("Column 1: Input")
+        layout = QtWidgets.QVBoxLayout(group)
 
         self.video_path_edit = QtWidgets.QLineEdit()
-        self.video_browse_button = QtWidgets.QPushButton("Browse Video")
-        self.video_browse_button.clicked.connect(self._browse_video)
+        browse_button = QtWidgets.QPushButton("Browse Video")
+        browse_button.clicked.connect(self._browse_video)
 
         video_layout = QtWidgets.QHBoxLayout()
         video_layout.addWidget(self.video_path_edit)
-        video_layout.addWidget(self.video_browse_button)
+        video_layout.addWidget(browse_button)
 
         source_group = QtWidgets.QGroupBox("Source Audio")
         source_layout = QtWidgets.QGridLayout(source_group)
@@ -1157,8 +1100,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_lang_combo.addItems(["auto", "en", "vi", "zh", "ja", "ko", "fr", "de", "es"])
 
         self.srt_path_edit = QtWidgets.QLineEdit()
-        self.srt_browse_button = QtWidgets.QPushButton("Browse SRT")
-        self.srt_browse_button.clicked.connect(self._browse_srt)
+        srt_button = QtWidgets.QPushButton("Browse SRT")
+        srt_button.clicked.connect(self._browse_srt)
 
         source_layout.addWidget(self.asr_radio, 0, 0, 1, 2)
         source_layout.addWidget(QtWidgets.QLabel("Whisper Model:"), 1, 0)
@@ -1167,17 +1110,17 @@ class MainWindow(QtWidgets.QMainWindow):
         source_layout.addWidget(self.source_lang_combo, 2, 1)
         source_layout.addWidget(self.srt_radio, 3, 0, 1, 2)
         source_layout.addWidget(self.srt_path_edit, 4, 0)
-        source_layout.addWidget(self.srt_browse_button, 4, 1)
+        source_layout.addWidget(srt_button, 4, 1)
 
         layout.addWidget(QtWidgets.QLabel("Video File"))
         layout.addLayout(video_layout)
         layout.addWidget(source_group)
         layout.addStretch()
-        return self.input_group
+        return group
 
     def _build_processing_column(self):
-        self.processing_group = QtWidgets.QGroupBox("Column 2: Processing")
-        layout = QtWidgets.QVBoxLayout(self.processing_group)
+        group = QtWidgets.QGroupBox("Column 2: Processing")
+        layout = QtWidgets.QVBoxLayout(group)
 
         translation_group = QtWidgets.QGroupBox("Translation")
         translation_layout = QtWidgets.QGridLayout(translation_group)
@@ -1240,14 +1183,14 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(glossary_group)
         layout.addWidget(tts_group)
         layout.addStretch()
-        return self.processing_group
+        return group
 
     def _build_output_column(self):
-        self.output_group = QtWidgets.QGroupBox("Column 3: Output / Preview")
-        layout = QtWidgets.QVBoxLayout(self.output_group)
+        group = QtWidgets.QGroupBox("Column 3: Output / Preview")
+        layout = QtWidgets.QVBoxLayout(group)
 
-        self.subtitle_group = QtWidgets.QGroupBox("Subtitles")
-        subtitle_layout = QtWidgets.QGridLayout(self.subtitle_group)
+        subtitle_group = QtWidgets.QGroupBox("Subtitles")
+        subtitle_layout = QtWidgets.QGridLayout(subtitle_group)
         self.subtitle_enable_checkbox = QtWidgets.QCheckBox("Enable Subtitles")
         self.font_family_combo = QtWidgets.QComboBox()
         self.font_family_combo.addItems(QtGui.QFontDatabase.families())
@@ -1276,8 +1219,8 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle_layout.addWidget(QtWidgets.QLabel("Position:"), 6, 0)
         subtitle_layout.addWidget(self.position_combo, 6, 1)
 
-        self.post_group = QtWidgets.QGroupBox("Post-Processing")
-        post_layout = QtWidgets.QGridLayout(self.post_group)
+        post_group = QtWidgets.QGroupBox("Post-Processing")
+        post_layout = QtWidgets.QGridLayout(post_group)
         self.mute_radio = QtWidgets.QRadioButton("Mute Original")
         self.duck_radio = QtWidgets.QRadioButton("Duck Audio")
         self.mute_radio.setChecked(True)
@@ -1303,11 +1246,10 @@ class MainWindow(QtWidgets.QMainWindow):
         post_layout.addWidget(self.blur_mode_combo, 4, 0, 1, 2)
         post_layout.addWidget(self.cuda_checkbox, 5, 0, 1, 2)
 
-        self.execution_group = QtWidgets.QGroupBox("Execution & Status")
-        execution_layout = QtWidgets.QVBoxLayout(self.execution_group)
+        execution_group = QtWidgets.QGroupBox("Execution & Status")
+        execution_layout = QtWidgets.QVBoxLayout(execution_group)
         self.start_button = QtWidgets.QPushButton("Start")
-        self.start_button.clicked.connect(self._toggle_processing)
-        self._start_button_default_style = self.start_button.styleSheet()
+        self.start_button.clicked.connect(self._start_processing)
         self.progress_bar = QtWidgets.QProgressBar()
         self.status_label = QtWidgets.QLabel("Idle")
         self.processing_time_label = QtWidgets.QLabel("Processing Time: 00:00")
@@ -1320,10 +1262,10 @@ class MainWindow(QtWidgets.QMainWindow):
         execution_layout.addWidget(self.processing_time_label)
         execution_layout.addWidget(self.log_console)
 
-        layout.addWidget(self.subtitle_group)
-        layout.addWidget(self.post_group)
-        layout.addWidget(self.execution_group)
-        return self.output_group
+        layout.addWidget(subtitle_group)
+        layout.addWidget(post_group)
+        layout.addWidget(execution_group)
+        return group
 
     def _load_defaults(self):
         self.target_lang_combo.setCurrentText(self.config.default_target_language)
@@ -1354,9 +1296,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.model_combo.addItem("No models found")
             return
         self.model_combo.addItems(models)
-        if self._session_state:
-            self._set_combo_value(self.model_combo, self._session_state)
-            self._session_state = None
 
     def _log_model_error(self, error: str):
         self.log_console.append(f"Model fetch failed: {error}")
@@ -1408,29 +1347,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if color.isValid():
             self.text_color_display.setText(color.name())
 
-    def _toggle_processing(self):
-        if self.worker and self.worker.isRunning():
-            self._stop_processing()
-            return
-        self._start_processing()
-
-    def _stop_processing(self):
-        if not self.worker or not self.worker.isRunning():
-            return
-        self._user_stop_requested = True
-        self.worker.stop()
-        self.worker.wait(500)
-        if self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(1000)
-        self._set_running_state(False)
-        self.progress_bar.setValue(0)
-        self.status_label.setText("Stopped")
-        self._stop_timer()
-        self.log_console.append("Process stopped by user.")
-
     def _start_processing(self):
-        self._user_stop_requested = False
+        if self.worker and self.worker.isRunning():
+            QtWidgets.QMessageBox.warning(self, "Busy", "Processing already running.")
+            return
         if self.tts_provider_combo.currentText() == "Custom API" and not self.config.custom_tts_url:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -1439,7 +1359,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        self.save_session_state()
         settings = AppSettings(
             video_path=self.video_path_edit.text().strip(),
             source_mode="ASR" if self.asr_radio.isChecked() else "SRT",
@@ -1477,46 +1396,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.log.connect(self.log_console.append)
         self.worker.finished.connect(self._handle_finished)
         self.worker.failed.connect(self._handle_failed)
-        self.worker.stopped.connect(self._handle_stopped)
         self.worker.started.connect(self._start_timer)
-        self._set_running_state(True)
         self.worker.start()
 
     def _handle_finished(self, output_path: str):
         self.status_label.setText("Done")
         self._stop_timer()
-        self._set_running_state(False)
-        self._user_stop_requested = False
         QtWidgets.QMessageBox.information(self, "Completed", f"Output saved to {output_path}")
 
     def _handle_failed(self, error: str):
         self.status_label.setText("Failed")
         self._stop_timer()
-        self._set_running_state(False)
-        self._user_stop_requested = False
         QtWidgets.QMessageBox.critical(self, "Error", error)
-
-    def _handle_stopped(self):
-        self.status_label.setText("Stopped")
-        self.progress_bar.setValue(0)
-        self._stop_timer()
-        self._set_running_state(False)
-        if not self._user_stop_requested:
-            self.log_console.append("Process stopped by user.")
-        self._user_stop_requested = False
-
-    def _set_running_state(self, running: bool):
-        if running:
-            self.start_button.setText("Stop")
-            self.start_button.setStyleSheet("background-color: #c62828; color: #ffffff;")
-        else:
-            self.start_button.setText("Start")
-            self.start_button.setStyleSheet(self._start_button_default_style)
-        self.input_group.setEnabled(not running)
-        self.processing_group.setEnabled(not running)
-        self.subtitle_group.setEnabled(not running)
-        self.post_group.setEnabled(not running)
-        self.settings_action.setEnabled(not running)
 
     def _init_timer(self):
         self._timer = QtCore.QTimer(self)
@@ -1536,118 +1427,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _stop_timer(self):
         self._timer.stop()
-
-    def _session_config_path(self) -> Path:
-        base_dir = self.config_manager.config_path.parent
-        base_dir.mkdir(parents=True, exist_ok=True)
-        return base_dir / "session_config.json"
-
-    def save_session_state(self) -> None:
-        video_path = self.video_path_edit.text().strip()
-        if video_path:
-            self.config.last_opened_directory = str(Path(video_path).parent)
-        data = {
-            "video_path": video_path,
-            "source_mode": "ASR" if self.asr_radio.isChecked() else "SRT",
-            "whisper_model": self.model_combo.currentText(),
-            "source_language": self.source_lang_combo.currentText(),
-            "provider": self.provider_combo.currentText(),
-            "provider_model": self.model_combo_provider.currentText(),
-            "target_language": self.target_lang_combo.currentText(),
-            "translate_all": self.translate_all_checkbox.isChecked(),
-            "glossary": self.glossary_text.toPlainText(),
-            "enable_tts": self.tts_enable_checkbox.isChecked(),
-            "tts_provider": self.tts_provider_combo.currentText(),
-            "force_audio_sync": self.force_sync_checkbox.isChecked(),
-            "speed": self.speed_input.value(),
-            "pitch": float(self.pitch_input.value()),
-            "enable_subtitles": self.subtitle_enable_checkbox.isChecked(),
-            "font_family": self.font_family_combo.currentText(),
-            "font_size": self.font_size_spin.value(),
-            "text_color": self.text_color_display.text(),
-            "border_width": self.border_width_spin.value(),
-            "position": self.position_combo.currentText(),
-            "mute_original": self.mute_radio.isChecked(),
-            "duck_audio": self.duck_input.value(),
-            "blur_fill": self.blur_checkbox.isChecked(),
-            "blur_height": self.blur_height_spin.value(),
-            "blur_mode": self.blur_mode_combo.currentText(),
-            "cuda": self.cuda_checkbox.isChecked(),
-            "last_opened_directory": self.config.last_opened_directory,
-            "config": {
-                "openai_api_key": self.config.openai_api_key,
-                "gemini_api_key": self.config.gemini_api_key,
-                "custom_tts_key": self.config.custom_tts_key,
-                "custom_tts_url": self.config.custom_tts_url,
-                "vbee_app_id": self.config.vbee_app_id,
-                "vbee_token": self.config.vbee_token,
-                "vbee_voice_code": self.config.vbee_voice_code,
-                "vbee_max_retries": self.config.vbee_max_retries,
-            },
-        }
-        session_path = self._session_config_path()
-        with session_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
-
-    def load_session_state(self) -> None:
-        session_path = self._session_config_path()
-        if not session_path.exists():
-            return
-        with session_path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        self.video_path_edit.setText(data.get("video_path", ""))
-        source_mode = data.get("source_mode", "ASR")
-        self.asr_radio.setChecked(source_mode == "ASR")
-        self.srt_radio.setChecked(source_mode == "SRT")
-        self.srt_path_edit.setText("")
-        self.source_lang_combo.setCurrentText(data.get("source_language", "auto"))
-        self.provider_combo.setCurrentText(data.get("provider", "Gemini"))
-        self._update_provider_models()
-        self._set_combo_value(self.model_combo_provider, data.get("provider_model", ""))
-        self.target_lang_combo.setCurrentText(data.get("target_language", "vi"))
-        self.translate_all_checkbox.setChecked(data.get("translate_all", False))
-        self.glossary_text.setPlainText(data.get("glossary", ""))
-        self.tts_enable_checkbox.setChecked(data.get("enable_tts", False))
-        self.tts_provider_combo.setCurrentText(data.get("tts_provider", "Edge TTS"))
-        self.force_sync_checkbox.setChecked(data.get("force_audio_sync", True))
-        self.speed_input.setValue(float(data.get("speed", 1.0)))
-        self.pitch_input.setValue(float(data.get("pitch", 0.0)))
-        self.subtitle_enable_checkbox.setChecked(data.get("enable_subtitles", True))
-        self._set_combo_value(self.font_family_combo, data.get("font_family", ""))
-        self.font_size_spin.setValue(int(data.get("font_size", 16)))
-        self.text_color_display.setText(data.get("text_color", "#FFFFFF"))
-        self.border_width_spin.setValue(int(data.get("border_width", 2)))
-        self.position_combo.setCurrentText(data.get("position", "Bottom"))
-        self.mute_radio.setChecked(data.get("mute_original", True))
-        self.duck_radio.setChecked(not data.get("mute_original", True))
-        self.duck_input.setValue(int(data.get("duck_audio", 30)))
-        self.blur_checkbox.setChecked(data.get("blur_fill", True))
-        self.blur_height_spin.setValue(int(data.get("blur_height", 20)))
-        self.blur_mode_combo.setCurrentText(data.get("blur_mode", "Blur"))
-        self.cuda_checkbox.setChecked(data.get("cuda", False))
-        self.config.last_opened_directory = data.get("last_opened_directory", "")
-        config_data = data.get("config", {})
-        self.config.openai_api_key = config_data.get("openai_api_key", self.config.openai_api_key)
-        self.config.gemini_api_key = config_data.get("gemini_api_key", self.config.gemini_api_key)
-        self.config.custom_tts_key = config_data.get("custom_tts_key", self.config.custom_tts_key)
-        self.config.custom_tts_url = config_data.get("custom_tts_url", self.config.custom_tts_url)
-        self.config.vbee_app_id = config_data.get("vbee_app_id", self.config.vbee_app_id)
-        self.config.vbee_token = config_data.get("vbee_token", self.config.vbee_token)
-        self.config.vbee_voice_code = config_data.get(
-            "vbee_voice_code",
-            self.config.vbee_voice_code,
-        )
-        self.config.vbee_max_retries = int(
-            config_data.get("vbee_max_retries", self.config.vbee_max_retries)
-        )
-        self._session_state = data.get("whisper_model")
-
-    def _set_combo_value(self, combo: QtWidgets.QComboBox, value: str) -> None:
-        if not value:
-            return
-        index = combo.findText(value)
-        if index >= 0:
-            combo.setCurrentIndex(index)
 
 
 def main():
