@@ -17,7 +17,7 @@ class AppConfig:
     vbee_max_retries: int = 10
     default_target_language: str = "vi"
     default_provider: str = "Gemini"
-    default_tts_provider: str = "Edge TTS"
+    default_tts_provider: str = "Custom API"
     default_translate_all: bool = True
     default_enable_tts: bool = False
     default_enable_subtitles: bool = True
@@ -35,6 +35,7 @@ class ConfigManager:
     def _default_config_path(self) -> Path:
         base_dir = Path.home() / ".video_translation_studio"
         base_dir.mkdir(parents=True, exist_ok=True)
+        print(base_dir)
         return base_dir / "config.json"
 
     def load(self) -> AppConfig:
