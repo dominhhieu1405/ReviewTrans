@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +18,7 @@ import requests
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from config_manager import AppConfig, ConfigManager
+from utils import escape_ffmpeg_path, generate_cache_key
 
 
 APP_NAME = "Video Translation Studio"
@@ -38,8 +41,11 @@ def optional_import(name: str):
 
 
 openai = optional_import("openai")
-genai = optional_import("google.generativeai")
 edge_tts = optional_import("edge_tts")
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
 
 def get_resource_path(relative_path: str) -> Path:
@@ -65,6 +71,49 @@ def find_tool(tool_name: str) -> Path | None:
     return None
 
 
+def download_ffmpeg(os_name: str, log_cb=None) -> Path:
+    bin_dir = get_resource_path("bin")
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if os_name == "windows":
+        url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        expected = ["ffmpeg.exe", "ffprobe.exe"]
+    elif os_name == "darwin":
+        url = "https://evermeet.cx/ffmpeg/getrelease/zip"
+        expected = ["ffmpeg", "ffprobe"]
+    else:
+        url = (
+            "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/"
+            "ffmpeg-master-latest-linux64-gpl.zip"
+        )
+        expected = ["ffmpeg", "ffprobe"]
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="ffmpeg_dl_"))
+    archive_path = temp_dir / Path(url).name
+    if log_cb:
+        log_cb(f"Downloading FFmpeg from {url}")
+    with requests.get(url, stream=True, timeout=120) as response:
+        response.raise_for_status()
+        with open(archive_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(temp_dir)
+    for binary in expected:
+        matches = list(temp_dir.rglob(binary))
+        if matches:
+            shutil.copy2(matches[0], bin_dir / binary)
+
+    for binary in expected:
+        target = bin_dir / binary
+        if not target.exists():
+            raise FileNotFoundError(f"Missing {binary} after extraction.")
+        if os_name != "windows":
+            target.chmod(0o755)
+    return bin_dir
+
+
 def run_subprocess(command: list[str], log_cb=None) -> int:
     if log_cb:
         log_cb(f"Running: {' '.join(command)}")
@@ -73,12 +122,96 @@ def run_subprocess(command: list[str], log_cb=None) -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if process.stdout:
         for line in process.stdout:
             if log_cb:
                 log_cb(line.rstrip())
     return process.wait()
+
+
+def get_audio_duration(path: Path, ffprobe_path: Path) -> float:
+    command = [
+        str(ffprobe_path),
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    try:
+        return float(process.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def get_video_duration(path: Path, ffprobe_path: Path) -> float:
+    command = [
+        str(ffprobe_path),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    try:
+        return float(process.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def get_video_height(path: Path, ffprobe_path: Path) -> int:
+    command = [
+        str(ffprobe_path),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=height",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    try:
+        return int(process.stdout.strip())
+    except ValueError:
+        return 0
 
 
 def fetch_whisper_models(log_cb=None) -> list[str]:
@@ -131,6 +264,12 @@ def parse_srt(content: str) -> list[dict]:
     return entries
 
 
+def parse_timestamp(timestamp: str) -> float:
+    hours, minutes, seconds = timestamp.split(":")
+    seconds, millis = seconds.split(",")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
+
+
 def render_srt(entries: list[dict]) -> str:
     blocks = []
     for entry in entries:
@@ -152,7 +291,7 @@ class AppSettings:
     glossary_instructions: str
     enable_tts: bool
     tts_provider: str
-    custom_api_url: str
+    force_audio_sync: bool
     speed: float
     pitch: float
     enable_subtitles: bool
@@ -178,6 +317,27 @@ class ModelFetchThread(QtCore.QThread):
         try:
             models = fetch_whisper_models()
             self.models_ready.emit(models)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class DependencyDownloadThread(QtCore.QThread):
+    status = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+    failed = QtCore.pyqtSignal(str)
+
+    def run(self):
+        try:
+            os_name = platform.system().lower()
+            if os_name.startswith("win"):
+                os_key = "windows"
+            elif os_name.startswith("darwin"):
+                os_key = "darwin"
+            else:
+                os_key = "linux"
+            self.status.emit("Downloading essential components (FFmpeg)...")
+            download_ffmpeg(os_key)
+            self.finished.emit()
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -211,6 +371,8 @@ class WorkerThread(QtCore.QThread):
 
         work_dir = Path(tempfile.mkdtemp(prefix="video_trans_"))
         self.log.emit(f"Working directory: {work_dir}")
+        cache_dir = get_resource_path("tmp")
+        cache_dir.mkdir(parents=True, exist_ok=True)
         ffmpeg_path = find_tool("ffmpeg")
         ffprobe_path = find_tool("ffprobe")
         if not ffmpeg_path or not ffprobe_path:
@@ -242,53 +404,90 @@ class WorkerThread(QtCore.QThread):
             whisper_path = find_tool("whisper")
             if not whisper_path:
                 raise FileNotFoundError("whisper executable not found in bin/ or tools/ folder.")
-            models_dir = Path.home() / ".video_translation_studio" / "models"
-            model_path = ensure_whisper_model(settings.whisper_model, models_dir, self.log.emit)
-            srt_path = work_dir / "transcript.srt"
-            whisper_command = [
-                str(whisper_path),
-                "-m",
-                str(model_path),
-                "-f",
-                str(audio_path),
-                "-l",
-                settings.source_language,
-                "-osrt",
-                "-of",
-                str(work_dir / "transcript"),
-            ]
-            if run_subprocess(whisper_command, self.log.emit) != 0:
-                raise RuntimeError("Whisper ASR failed.")
+            video_path = Path(settings.video_path)
+            video_stem = video_path.stem
+            cached_asr = cache_dir / (
+                f"asr_{video_stem}_{settings.whisper_model}_{settings.source_language}.srt"
+            )
+            if cached_asr.exists():
+                self.log.emit("Restored ASR from cache.")
+                srt_path = cached_asr
+            else:
+                models_dir = Path.home() / ".video_translation_studio" / "models"
+                model_path = ensure_whisper_model(
+                    settings.whisper_model,
+                    models_dir,
+                    self.log.emit,
+                )
+                srt_path = work_dir / "transcript.srt"
+                whisper_command = [
+                    str(whisper_path),
+                    "-m",
+                    str(model_path),
+                    "-f",
+                    str(audio_path),
+                    "-l",
+                    settings.source_language,
+                    "-osrt",
+                    "-of",
+                    str(work_dir / "transcript"),
+                ]
+                if run_subprocess(whisper_command, self.log.emit) != 0:
+                    raise RuntimeError("Whisper ASR failed.")
+                shutil.copy2(srt_path, cached_asr)
         else:
             if not settings.srt_path:
                 raise ValueError("SRT path is required when using SRT mode.")
             srt_path = Path(settings.srt_path)
 
         self._step(40, "Translating subtitles")
-        with open(srt_path, "r", encoding="utf-8") as handle:
-            entries = parse_srt(handle.read())
+        with open(srt_path, "r", encoding="utf-8", errors="replace") as handle:
+            source_content = handle.read()
+        entries = parse_srt(source_content)
 
-        translated_entries = self._translate_entries(entries, settings)
-        translated_srt = work_dir / "translated.srt"
-        with open(translated_srt, "w", encoding="utf-8") as handle:
-            handle.write(render_srt(translated_entries))
+        video_stem = Path(settings.video_path).stem
+        translated_srt = cache_dir / (
+            f"trans_{video_stem}_{settings.provider_model}_{settings.target_language}.srt"
+        )
+        if translated_srt.exists():
+            self.log.emit("Restored translation from cache.")
+            with open(translated_srt, "r", encoding="utf-8", errors="replace") as handle:
+                translated_entries = parse_srt(handle.read())
+        else:
+            translated_entries = self._translate_entries(entries, settings)
+            with open(translated_srt, "w", encoding="utf-8", errors="replace") as handle:
+                handle.write(render_srt(translated_entries))
 
         tts_audio = None
         if settings.enable_tts:
             self._step(60, "Generating TTS")
-            tts_audio = work_dir / "tts_audio.wav"
-            self._generate_tts(translated_entries, tts_audio)
-            self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
+            translated_text = "\n".join(entry["text"] for entry in translated_entries)
+            tts_key = generate_cache_key(
+                translated_text,
+                settings.tts_provider,
+                settings.target_language,
+                settings.speed,
+                settings.pitch,
+                settings.force_audio_sync,
+            )
+            tts_audio = cache_dir / f"dub_{tts_key}.wav"
+            if tts_audio.exists():
+                self.log.emit("Restored TTS from cache.")
+            else:
+                video_duration = get_video_duration(Path(settings.video_path), ffprobe_path)
+                self._generate_tts(
+                    translated_entries,
+                    tts_audio,
+                    ffmpeg_path,
+                    ffprobe_path,
+                    video_duration,
+                    cache_dir,
+                    settings.force_audio_sync,
+                )
+                self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
         self._step(80, "Rendering output")
-        filters = []
-        if settings.enable_subtitles:
-            subtitle_filter = self._build_subtitle_filter(translated_srt, settings)
-            filters.append(subtitle_filter)
-        if settings.blur_fill:
-            filters.append(self._build_blur_filter(settings))
-
-        filter_complex = ",".join(filters) if filters else None
+        video_height = get_video_height(Path(settings.video_path), ffprobe_path)
         render_command = [
             str(ffmpeg_path),
             "-y",
@@ -297,18 +496,30 @@ class WorkerThread(QtCore.QThread):
         ]
         if tts_audio:
             render_command += ["-i", str(tts_audio)]
-        if filter_complex:
-            render_command += ["-vf", filter_complex]
+        video_filter_args = self._build_video_filter_args(
+            translated_srt,
+            settings,
+            video_height,
+        )
+        render_command += video_filter_args
 
+        has_video_map = "-map" in video_filter_args
         if tts_audio:
-            render_command += ["-map", "0:v", "-map", "1:a"]
+            if not has_video_map:
+                render_command += ["-map", "0:v"]
+            render_command += ["-map", "1:a"]
+        else:
+            if not has_video_map:
+                render_command += ["-map", "0:v"]
+            render_command += ["-map", "0:a?"]
         if settings.mute_original:
             render_command += ["-c:a", "aac", "-b:a", "192k"]
         else:
             duck_volume = max(0.1, settings.duck_audio / 100.0)
             render_command += ["-filter:a", f"volume={duck_volume}"]
 
-        output_dir = Path(settings.output_dir or work_dir)
+        video_dir = Path(settings.video_path).parent
+        output_dir = video_dir / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{Path(settings.video_path).stem}_translated.mp4"
         render_command.append(str(output_path))
@@ -326,7 +537,7 @@ class WorkerThread(QtCore.QThread):
         if settings.provider == "ChatGPT" and openai is None:
             raise RuntimeError("openai package not installed.")
         if settings.provider == "Gemini" and genai is None:
-            raise RuntimeError("google-generativeai package not installed.")
+            raise RuntimeError("google-genai package not installed.")
 
         if settings.translate_all:
             combined_text = "\n".join(entry["text"] for entry in entries)
@@ -341,7 +552,19 @@ class WorkerThread(QtCore.QThread):
 
     def _translate_text(self, text: str, settings: AppSettings) -> str:
         glossary = settings.glossary_instructions.strip()
-        system_instructions = "You are a professional translator."
+        system_instructions = (
+            "You are a professional translator.\n"
+            "CONSTRAINT: You are translating for Movie Dubbing. The translated text must "
+            "be concise and match the spoken duration of the original text as closely as "
+            "possible. Avoid wordy explanations or expansions. Choose shorter synonyms "
+            "where possible. If the source sentence is short (e.g., 'No.'), the target must "
+            "be short (e.g., 'Không.'). Do not make it 'Tôi không đồng ý với điều đó.' "
+            "unless necessary for context.\n"
+            "RULE: If a sentence translates to a single word (e.g., 'Không', 'Được'), you "
+            "MUST merge it into the previous or next sentence, whichever fits the context "
+            "better. Ensure every translated segment has at least 2 words or is "
+            "grammatically complete."
+        )
         if glossary:
             system_instructions += f"\nAdditional instructions:\n{glossary}"
         prompt = (
@@ -360,27 +583,97 @@ class WorkerThread(QtCore.QThread):
             )
             return response.choices[0].message.content.strip()
         if settings.provider == "Gemini":
-            genai.configure(api_key=self.config.gemini_api_key)
-            model = genai.GenerativeModel(settings.provider_model)
-            response = model.generate_content(f"{system_instructions}\n\n{prompt}")
+            client = genai.Client(api_key=self.config.gemini_api_key)
+            response = client.models.generate_content(
+                model=settings.provider_model,
+                contents=f"{system_instructions}\n\n{prompt}",
+            )
             return response.text.strip()
         return text
 
-    def _generate_tts(self, entries: list[dict], output_path: Path):
-        text = "\n".join(entry["text"] for entry in entries)
+    def _generate_tts(
+        self,
+        entries: list[dict],
+        output_path: Path,
+        ffmpeg_path: Path,
+        ffprobe_path: Path,
+        video_duration: float,
+        cache_dir: Path,
+        force_audio_sync: bool,
+    ):
+        segment_paths = []
+        for idx, entry in enumerate(entries, start=1):
+            timestamps = entry["timestamps"].split(" --> ")
+            if len(timestamps) != 2:
+                continue
+            start_time = parse_timestamp(timestamps[0])
+            end_time = parse_timestamp(timestamps[1])
+            max_duration = max(0.1, end_time - start_time)
+            raw_path = self._generate_tts_segment(
+                entry["text"],
+                idx,
+                cache_dir,
+                ffmpeg_path,
+            )
+            adjusted_path = raw_path
+            if force_audio_sync:
+                adjusted_path = self._fit_audio_to_slot(
+                    raw_path,
+                    max_duration,
+                    ffmpeg_path,
+                    ffprobe_path,
+                )
+            delay_ms = int(start_time * 1000)
+            segment_paths.append((adjusted_path, delay_ms))
+
+        if not segment_paths:
+            raise RuntimeError("No TTS segments generated.")
+
+        self._mix_segments(segment_paths, output_path, ffmpeg_path, video_duration)
+
+    def _generate_tts_segment(
+        self,
+        text: str,
+        index: int,
+        cache_dir: Path,
+        ffmpeg_path: Path,
+    ) -> Path:
+        speed_rate = max(0.1, min(1.9, self.settings.speed))
+        raw_key = generate_cache_key(
+            text,
+            self.settings.tts_provider,
+            self.settings.target_language,
+            self.config.custom_tts_url,
+            self.config.custom_tts_key,
+            self.config.vbee_app_id,
+            self.config.vbee_voice_code,
+            speed_rate,
+        )
+        output_path = cache_dir / f"tts_raw_{raw_key}_{index}.wav"
+        if output_path.exists():
+            self.log.emit("Restored TTS segment from cache.")
+            return output_path
+
+        temp_output = output_path.with_suffix(".mp3")
         if self.settings.tts_provider == "Edge TTS":
             if edge_tts is None:
                 raise RuntimeError("edge-tts package not installed.")
 
             async def _run():
                 communicate = edge_tts.Communicate(text, self.settings.target_language)
-                await communicate.save(str(output_path))
+                await communicate.save(str(temp_output))
 
             thread = threading.Thread(target=lambda: asyncio.run(_run()), daemon=True)
             thread.start()
             thread.join()
+        elif self.settings.tts_provider == "vBee TTS":
+            audio_url = self._generate_vbee_tts(text, speed_rate)
+            audio_response = requests.get(audio_url, timeout=60)
+            audio_response.raise_for_status()
+            with open(temp_output, "wb") as handle:
+                handle.write(audio_response.content)
         else:
-            if not self.settings.custom_api_url:
+            if not self.config.custom_tts_url:
                 raise ValueError("Custom API URL is required.")
             payload = {
                 "text": text,
@@ -390,7 +683,7 @@ class WorkerThread(QtCore.QThread):
             if self.config.custom_tts_key:
                 headers["Authorization"] = self.config.custom_tts_key
             response = requests.post(
-                self.settings.custom_api_url,
+                self.config.custom_tts_url,
                 data=payload,
                 headers=headers,
                 timeout=60,
@@ -404,8 +697,185 @@ class WorkerThread(QtCore.QThread):
                 raise RuntimeError("Custom API response missing audio URL.")
             audio_response = requests.get(audio_url, timeout=60)
             audio_response.raise_for_status()
-            with open(output_path, "wb") as handle:
+            with open(temp_output, "wb") as handle:
                 handle.write(audio_response.content)
+
+        convert_command = [
+            str(ffmpeg_path),
+            "-y",
+            "-i",
+            str(temp_output),
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            str(output_path),
+        ]
+        if run_subprocess(convert_command, self.log.emit) != 0:
+            raise RuntimeError("TTS audio conversion failed.")
+        if temp_output.exists():
+            temp_output.unlink()
+        return output_path
+
+    def _generate_vbee_tts(self, text: str, speed_rate: float) -> str:
+        if not self.config.vbee_app_id or not self.config.vbee_token:
+            raise ValueError("vBee credentials are required.")
+        payload = {
+            "app_id": self.config.vbee_app_id,
+            "response_type": "indirect",
+            "callbackUrl": "https://www.k6vn.org/",
+            "input_text": text,
+            "voice_code": self.config.vbee_voice_code,
+            "speed_rate": f"{speed_rate:.2f}",
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.vbee_token}",
+        }
+        response = requests.post(
+            "https://vbee.vn/api/v1/tts",
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") != 1:
+            raise RuntimeError("vBee TTS request failed.")
+        request_id = data.get("result", {}).get("request_id")
+        if not request_id:
+            raise RuntimeError("vBee TTS missing request_id.")
+
+        for _ in range(self.config.vbee_max_retries):
+            time.sleep(1)
+            poll_response = requests.get(
+                f"https://vbee.vn/api/v1/tts/{request_id}",
+                headers={"Authorization": f"Bearer {self.config.vbee_token}"},
+                timeout=30,
+            )
+            poll_response.raise_for_status()
+            poll_data = poll_response.json()
+            audio_link = poll_data.get("result", {}).get("audio_link")
+            if audio_link:
+                return audio_link
+        raise TimeoutError("vBee TTS polling timed out.")
+
+    def _build_atempo_chain(self, speed_factor: float) -> str:
+        factors = []
+        remaining = speed_factor
+        while remaining > 2.0:
+            factors.append(2.0)
+            remaining /= 2.0
+        factors.append(max(0.5, min(2.0, remaining)))
+        return ",".join(f"atempo={factor}" for factor in factors)
+
+    def _fit_audio_to_slot(
+        self,
+        file_path: Path,
+        max_duration: float,
+        ffmpeg_path: Path,
+        ffprobe_path: Path,
+    ) -> Path:
+        current_duration = get_audio_duration(file_path, ffprobe_path)
+        if current_duration <= 0:
+            return file_path
+        speed_factor = current_duration / max_duration if current_duration > max_duration else 1.0
+        atempo_chain = self._build_atempo_chain(speed_factor)
+        adjusted_path = file_path.with_name(f"{file_path.stem}_fit.wav")
+        filter_chain = f"{atempo_chain},apad=pad_dur={max_duration},atrim=0:{max_duration}"
+        command = [
+            str(ffmpeg_path),
+            "-y",
+            "-i",
+            str(file_path),
+            "-filter:a",
+            filter_chain,
+            str(adjusted_path),
+        ]
+        if run_subprocess(command, self.log.emit) != 0:
+            raise RuntimeError("Audio time-stretch failed.")
+        return adjusted_path
+
+    def _mix_segments(
+        self,
+        segment_paths: list[tuple[Path, int]],
+        output_path: Path,
+        ffmpeg_path: Path,
+        video_duration: float,
+    ):
+        batch_size = 20
+        temp_files: list[Path] = []
+        base_audio = output_path.with_name("base_accumulator.wav")
+        temp_mix = output_path.with_name("temp_mix.wav")
+        try:
+            base_command = [
+                str(ffmpeg_path),
+                "-y",
+                "-f",
+                "lavfi",
+                "-t",
+                f"{max(video_duration, 0.1)}",
+                "-i",
+                "anullsrc=channel_layout=mono:sample_rate=44100",
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                str(base_audio),
+            ]
+            if run_subprocess(base_command, self.log.emit) != 0:
+                raise RuntimeError("Base audio generation failed.")
+            temp_files.append(base_audio)
+
+            for start in range(0, len(segment_paths), batch_size):
+                batch = segment_paths[start : start + batch_size]
+                command = [str(ffmpeg_path), "-y", "-i", str(base_audio)]
+                filter_parts = []
+                inputs = ["[0:a]"]
+                for idx, (path, delay_ms) in enumerate(batch):
+                    command += ["-i", str(path)]
+                    input_index = idx + 1
+                    filter_parts.append(
+                        f"[{input_index}:a]adelay={delay_ms}|{delay_ms}[a{input_index}]"
+                    )
+                    inputs.append(f"[a{input_index}]")
+                filter_parts.append(
+                    f"{''.join(inputs)}amix=inputs={len(inputs)}:"
+                    "duration=first:dropout_transition=0:normalize=0[aout]"
+                )
+                filter_complex = ";".join(filter_parts)
+                command += [
+                    "-filter_complex",
+                    filter_complex,
+                    "-map",
+                    "[aout]",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "44100",
+                    str(temp_mix),
+                ]
+                if run_subprocess(command, self.log.emit) != 0:
+                    raise RuntimeError("TTS segment mixing failed.")
+                shutil.move(temp_mix, base_audio)
+
+            final_command = [
+                str(ffmpeg_path),
+                "-y",
+                "-i",
+                str(base_audio),
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                str(output_path),
+            ]
+            if run_subprocess(final_command, self.log.emit) != 0:
+                raise RuntimeError("Final audio export failed.")
+        finally:
+            for temp_file in temp_files + [temp_mix]:
+                if temp_file.exists():
+                    temp_file.unlink()
 
     def _apply_audio_fx(self, audio_path: Path, settings: AppSettings, ffmpeg_path: Path):
         if settings.speed == 1.0 and settings.pitch == 0.0:
@@ -427,26 +897,65 @@ class WorkerThread(QtCore.QThread):
             raise RuntimeError("Audio post-processing failed.")
         shutil.move(fx_output, audio_path)
 
-    def _build_subtitle_filter(self, srt_path: Path, settings: AppSettings) -> str:
+    def _build_subtitle_filter(
+        self,
+        srt_path: Path,
+        settings: AppSettings,
+        margin_v: int,
+    ) -> str:
         alignment = {"Bottom": "2", "Center": "5", "Top": "8"}.get(settings.position, "2")
         style = (
             f"FontName={settings.font_family},"
             f"FontSize={settings.font_size},"
             f"PrimaryColour=&H{settings.text_color.lstrip('#')},"
             f"Outline={settings.border_width},"
-            f"Alignment={alignment}"
+            f"Alignment={alignment},"
+            f"MarginV={margin_v}"
         )
-        return f"subtitles='{srt_path}':force_style='{style}'"
+        safe_path = escape_ffmpeg_path(str(srt_path))
+        return f"subtitles='{safe_path}':force_style='{style}'"
 
     def _build_blur_filter(self, settings: AppSettings) -> str:
-        height_ratio = max(1, min(100, settings.blur_height)) / 100.0
         if settings.blur_mode == "Blur":
             return (
                 "boxblur=luma_radius=10:luma_power=1:"
                 "chroma_radius=10:chroma_power=1"
             )
         color = "black"
-        return f"drawbox=y=ih*{1 - height_ratio}:h=ih*{height_ratio}:color={color}:t=fill"
+        return f"drawbox=y=0:h=ih:color={color}:t=fill"
+
+    def _build_video_filter_args(
+        self,
+        srt_path: Path,
+        settings: AppSettings,
+        video_height: int,
+    ) -> list[str]:
+        margin_v = int(video_height * 0.05) if video_height > 0 else 0
+        if not settings.blur_fill:
+            if settings.enable_subtitles:
+                return [
+                    "-vf",
+                    self._build_subtitle_filter(srt_path, settings, margin_v),
+                ]
+            return []
+
+        height_ratio = min(0.95, max(0.01, settings.blur_height / 100.0))
+        margin_ratio = 0.05
+        crop_h = f"ih*{height_ratio}"
+        crop_y = f"ih*{1 - margin_ratio - height_ratio}"
+        blur_filter = self._build_blur_filter(settings)
+        filter_parts = [
+            f"[0:v]crop=iw:{crop_h}:0:{crop_y}[bottom]",
+            f"[bottom]{blur_filter}[blurred]",
+            f"[0:v][blurred]overlay=0:main_h*{1 - margin_ratio - height_ratio}[bg_processed]",
+        ]
+        if settings.enable_subtitles:
+            subtitle_filter = self._build_subtitle_filter(srt_path, settings, margin_v)
+            filter_parts.append(f"[bg_processed]{subtitle_filter}[vout]")
+        else:
+            filter_parts.append("[bg_processed]null[vout]")
+        filter_complex = ";".join(filter_parts)
+        return ["-filter_complex", filter_complex, "-map", "[vout]"]
 
 
 class SettingsDialog(QtWidgets.QDialog):
@@ -457,24 +966,43 @@ class SettingsDialog(QtWidgets.QDialog):
         self.config_manager = config_manager
         self.config = config_manager.config
 
-        layout = QtWidgets.QFormLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
+        tabs = QtWidgets.QTabWidget()
+
+        general_tab = QtWidgets.QWidget()
+        general_layout = QtWidgets.QFormLayout(general_tab)
         self.openai_key_edit = QtWidgets.QLineEdit(self.config.openai_api_key)
         self.openai_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.gemini_key_edit = QtWidgets.QLineEdit(self.config.gemini_api_key)
         self.gemini_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.custom_tts_key_edit = QtWidgets.QLineEdit(self.config.custom_tts_key)
         self.custom_tts_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self.output_dir_edit = QtWidgets.QLineEdit(self.config.default_output_dir)
-        output_button = QtWidgets.QPushButton("Browse")
-        output_button.clicked.connect(self._browse_output_dir)
-        output_layout = QtWidgets.QHBoxLayout()
-        output_layout.addWidget(self.output_dir_edit)
-        output_layout.addWidget(output_button)
+        general_layout.addRow("OpenAI API Key:", self.openai_key_edit)
+        general_layout.addRow("Gemini API Key:", self.gemini_key_edit)
+        general_layout.addRow("Custom TTS Key:", self.custom_tts_key_edit)
 
-        layout.addRow("OpenAI API Key:", self.openai_key_edit)
-        layout.addRow("Gemini API Key:", self.gemini_key_edit)
-        layout.addRow("Custom TTS Key:", self.custom_tts_key_edit)
-        layout.addRow("Default Output Folder:", output_layout)
+        tts_tab = QtWidgets.QWidget()
+        tts_layout = QtWidgets.QFormLayout(tts_tab)
+        self.custom_tts_url_edit = QtWidgets.QLineEdit(self.config.custom_tts_url)
+        self.custom_tts_url_edit.setPlaceholderText("https://example.com/tts")
+        tts_layout.addRow("Custom TTS API URL:", self.custom_tts_url_edit)
+
+        self.vbee_app_id_edit = QtWidgets.QLineEdit(self.config.vbee_app_id)
+        self.vbee_token_edit = QtWidgets.QLineEdit(self.config.vbee_token)
+        self.vbee_token_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.vbee_voice_code_edit = QtWidgets.QLineEdit(self.config.vbee_voice_code)
+        self.vbee_max_retries_spin = QtWidgets.QSpinBox()
+        self.vbee_max_retries_spin.setRange(1, 60)
+        self.vbee_max_retries_spin.setValue(self.config.vbee_max_retries)
+
+        tts_layout.addRow("vBee App ID:", self.vbee_app_id_edit)
+        tts_layout.addRow("vBee Token:", self.vbee_token_edit)
+        tts_layout.addRow("vBee Voice Code:", self.vbee_voice_code_edit)
+        tts_layout.addRow("vBee Max Retries:", self.vbee_max_retries_spin)
+
+        tabs.addTab(general_tab, "General")
+        tabs.addTab(tts_tab, "TTS / Dubbing")
+        layout.addWidget(tabs)
 
         button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Save
@@ -482,18 +1010,17 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         button_box.accepted.connect(self._save)
         button_box.rejected.connect(self.reject)
-        layout.addRow(button_box)
-
-    def _browse_output_dir(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder")
-        if path:
-            self.output_dir_edit.setText(path)
+        layout.addWidget(button_box)
 
     def _save(self):
         self.config.openai_api_key = self.openai_key_edit.text().strip()
         self.config.gemini_api_key = self.gemini_key_edit.text().strip()
         self.config.custom_tts_key = self.custom_tts_key_edit.text().strip()
-        self.config.default_output_dir = self.output_dir_edit.text().strip()
+        self.config.custom_tts_url = self.custom_tts_url_edit.text().strip()
+        self.config.vbee_app_id = self.vbee_app_id_edit.text().strip()
+        self.config.vbee_token = self.vbee_token_edit.text().strip()
+        self.config.vbee_voice_code = self.vbee_voice_code_edit.text().strip()
+        self.config.vbee_max_retries = self.vbee_max_retries_spin.value()
         self.config_manager.save()
         self.accept()
 
@@ -523,10 +1050,10 @@ class MainWindow(QtWidgets.QMainWindow):
         column_layout.addWidget(self._build_output_column())
 
         self._update_source_mode()
-        self._update_tts_provider()
         self._update_provider_models()
         self._load_defaults()
         self._fetch_models_async()
+        self._init_timer()
 
     def _build_menu(self):
         menu = self.menuBar().addMenu("Settings")
@@ -599,7 +1126,7 @@ class MainWindow(QtWidgets.QMainWindow):
         translation_layout = QtWidgets.QGridLayout(translation_group)
 
         self.provider_combo = QtWidgets.QComboBox()
-        self.provider_combo.addItems(["ChatGPT", "Gemini"])
+        self.provider_combo.addItems(["Gemini", "ChatGPT"])
         self.provider_combo.currentTextChanged.connect(self._update_provider_models)
         self.model_combo_provider = QtWidgets.QComboBox()
         self.target_lang_combo = QtWidgets.QComboBox()
@@ -626,28 +1153,31 @@ class MainWindow(QtWidgets.QMainWindow):
         tts_layout = QtWidgets.QGridLayout(tts_group)
         self.tts_enable_checkbox = QtWidgets.QCheckBox("Enable TTS")
         self.tts_provider_combo = QtWidgets.QComboBox()
-        self.tts_provider_combo.addItems(["Edge TTS", "Custom API"])
-        self.tts_provider_combo.currentTextChanged.connect(self._update_tts_provider)
-        self.api_url_edit = QtWidgets.QLineEdit()
-        self.api_url_edit.setPlaceholderText("Custom API URL")
-        self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.speed_slider.setMinimum(50)
-        self.speed_slider.setMaximum(200)
-        self.speed_slider.setValue(100)
-        self.pitch_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.pitch_slider.setMinimum(-12)
-        self.pitch_slider.setMaximum(12)
-        self.pitch_slider.setValue(0)
+        self.tts_provider_combo.addItems(["Edge TTS", "Custom API", "vBee TTS"])
+        self.force_sync_checkbox = QtWidgets.QCheckBox("Force Audio Sync (Fit to Slot)")
+        self.force_sync_checkbox.setChecked(True)
+        self.force_sync_checkbox.setToolTip(
+            "If checked, audio speed will be adjusted to fit strictly within the subtitle "
+            "timeline. If unchecked, audio plays at natural speed (may overlap with next "
+            "sentence)."
+        )
+        self.speed_input = QtWidgets.QDoubleSpinBox()
+        self.speed_input.setRange(0.5, 2.0)
+        self.speed_input.setSingleStep(0.1)
+        self.speed_input.setValue(1.0)
+        self.pitch_input = QtWidgets.QDoubleSpinBox()
+        self.pitch_input.setRange(-12.0, 12.0)
+        self.pitch_input.setSingleStep(0.5)
+        self.pitch_input.setValue(0.0)
 
         tts_layout.addWidget(self.tts_enable_checkbox, 0, 0, 1, 2)
         tts_layout.addWidget(QtWidgets.QLabel("Provider:"), 1, 0)
         tts_layout.addWidget(self.tts_provider_combo, 1, 1)
-        tts_layout.addWidget(QtWidgets.QLabel("Custom API URL:"), 2, 0)
-        tts_layout.addWidget(self.api_url_edit, 2, 1)
+        tts_layout.addWidget(self.force_sync_checkbox, 2, 0, 1, 2)
         tts_layout.addWidget(QtWidgets.QLabel("Speed:"), 3, 0)
-        tts_layout.addWidget(self.speed_slider, 3, 1)
+        tts_layout.addWidget(self.speed_input, 3, 1)
         tts_layout.addWidget(QtWidgets.QLabel("Pitch:"), 4, 0)
-        tts_layout.addWidget(self.pitch_slider, 4, 1)
+        tts_layout.addWidget(self.pitch_input, 4, 1)
 
         layout.addWidget(translation_group)
         layout.addWidget(glossary_group)
@@ -662,10 +1192,11 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle_group = QtWidgets.QGroupBox("Subtitles")
         subtitle_layout = QtWidgets.QGridLayout(subtitle_group)
         self.subtitle_enable_checkbox = QtWidgets.QCheckBox("Enable Subtitles")
-        self.font_family_edit = QtWidgets.QLineEdit("Arial")
+        self.font_family_combo = QtWidgets.QComboBox()
+        self.font_family_combo.addItems(QtGui.QFontDatabase.families())
         self.font_size_spin = QtWidgets.QSpinBox()
         self.font_size_spin.setRange(8, 72)
-        self.font_size_spin.setValue(24)
+        self.font_size_spin.setValue(16)
         self.text_color_button = QtWidgets.QPushButton("Select Color")
         self.text_color_button.clicked.connect(self._select_color)
         self.text_color_display = QtWidgets.QLineEdit("#FFFFFF")
@@ -677,7 +1208,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         subtitle_layout.addWidget(self.subtitle_enable_checkbox, 0, 0, 1, 2)
         subtitle_layout.addWidget(QtWidgets.QLabel("Font Family:"), 1, 0)
-        subtitle_layout.addWidget(self.font_family_edit, 1, 1)
+        subtitle_layout.addWidget(self.font_family_combo, 1, 1)
         subtitle_layout.addWidget(QtWidgets.QLabel("Font Size:"), 2, 0)
         subtitle_layout.addWidget(self.font_size_spin, 2, 1)
         subtitle_layout.addWidget(QtWidgets.QLabel("Text Color:"), 3, 0)
@@ -693,11 +1224,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mute_radio = QtWidgets.QRadioButton("Mute Original")
         self.duck_radio = QtWidgets.QRadioButton("Duck Audio")
         self.mute_radio.setChecked(True)
-        self.duck_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.duck_slider.setMinimum(1)
-        self.duck_slider.setMaximum(100)
-        self.duck_slider.setValue(30)
+        self.duck_input = QtWidgets.QSpinBox()
+        self.duck_input.setRange(0, 100)
+        self.duck_input.setValue(30)
         self.blur_checkbox = QtWidgets.QCheckBox("Blur/Fill Bottom")
+        self.blur_checkbox.setChecked(True)
         self.blur_height_spin = QtWidgets.QSpinBox()
         self.blur_height_spin.setRange(5, 50)
         self.blur_height_spin.setValue(20)
@@ -708,7 +1239,7 @@ class MainWindow(QtWidgets.QMainWindow):
         post_layout.addWidget(self.mute_radio, 0, 0)
         post_layout.addWidget(self.duck_radio, 0, 1)
         post_layout.addWidget(QtWidgets.QLabel("Duck Volume:"), 1, 0)
-        post_layout.addWidget(self.duck_slider, 1, 1)
+        post_layout.addWidget(self.duck_input, 1, 1)
         post_layout.addWidget(self.blur_checkbox, 2, 0)
         post_layout.addWidget(QtWidgets.QLabel("Height %:"), 3, 0)
         post_layout.addWidget(self.blur_height_spin, 3, 1)
@@ -721,12 +1252,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_button.clicked.connect(self._start_processing)
         self.progress_bar = QtWidgets.QProgressBar()
         self.status_label = QtWidgets.QLabel("Idle")
+        self.processing_time_label = QtWidgets.QLabel("Processing Time: 00:00")
         self.log_console = QtWidgets.QTextEdit()
         self.log_console.setReadOnly(True)
 
         execution_layout.addWidget(self.start_button)
         execution_layout.addWidget(self.progress_bar)
         execution_layout.addWidget(self.status_label)
+        execution_layout.addWidget(self.processing_time_label)
         execution_layout.addWidget(self.log_console)
 
         layout.addWidget(subtitle_group)
@@ -737,11 +1270,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_defaults(self):
         self.target_lang_combo.setCurrentText(self.config.default_target_language)
         self.provider_combo.setCurrentText(self.config.default_provider)
+        self.model_combo_provider.setCurrentText("gemini-flash-latest")
         self.tts_provider_combo.setCurrentText(self.config.default_tts_provider)
         self.translate_all_checkbox.setChecked(self.config.default_translate_all)
         self.tts_enable_checkbox.setChecked(self.config.default_enable_tts)
         self.subtitle_enable_checkbox.setChecked(self.config.default_enable_subtitles)
         self.source_lang_combo.setCurrentText(self.config.default_whisper_language)
+        if "Arial" in QtGui.QFontDatabase.families():
+            self.font_family_combo.setCurrentText("Arial")
 
     def _open_settings(self):
         dialog = SettingsDialog(self.config_manager, self)
@@ -778,21 +1314,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if provider == "ChatGPT":
             self.model_combo_provider.addItems(OPENAI_MODELS)
         else:
-            self.model_combo_provider.addItems(GEMINI_MODELS)
-
-    def _update_tts_provider(self):
-        use_custom = self.tts_provider_combo.currentText() == "Custom API"
-        self.api_url_edit.setVisible(use_custom)
+            self.model_combo_provider.addItems(
+                ["gemini-flash-latest"]
+                + [model for model in GEMINI_MODELS if model != "gemini-flash-latest"]
+            )
 
     def _browse_video(self):
+        start_dir = self.config.last_opened_directory or ""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Video",
-            "",
+            start_dir,
             f"Video Files ({SUPPORTED_VIDEO_EXTENSIONS})",
         )
         if path:
             self.video_path_edit.setText(path)
+            self.config.last_opened_directory = str(Path(path).parent)
+            self.config_manager.save()
 
     def _browse_srt(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -813,6 +1351,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker and self.worker.isRunning():
             QtWidgets.QMessageBox.warning(self, "Busy", "Processing already running.")
             return
+        if self.tts_provider_combo.currentText() == "Custom API" and not self.config.custom_tts_url:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing Configuration",
+                "Please configure the Custom TTS Endpoint in Settings.",
+            )
+            return
 
         settings = AppSettings(
             video_path=self.video_path_edit.text().strip(),
@@ -827,22 +1372,22 @@ class MainWindow(QtWidgets.QMainWindow):
             glossary_instructions=self.glossary_text.toPlainText(),
             enable_tts=self.tts_enable_checkbox.isChecked(),
             tts_provider=self.tts_provider_combo.currentText(),
-            custom_api_url=self.api_url_edit.text().strip(),
-            speed=self.speed_slider.value() / 100.0,
-            pitch=float(self.pitch_slider.value()),
+            force_audio_sync=self.force_sync_checkbox.isChecked(),
+            speed=self.speed_input.value(),
+            pitch=float(self.pitch_input.value()),
             enable_subtitles=self.subtitle_enable_checkbox.isChecked(),
-            font_family=self.font_family_edit.text().strip(),
+            font_family=self.font_family_combo.currentText().strip(),
             font_size=self.font_size_spin.value(),
             text_color=self.text_color_display.text().strip(),
             border_width=self.border_width_spin.value(),
             position=self.position_combo.currentText(),
             mute_original=self.mute_radio.isChecked(),
-            duck_audio=self.duck_slider.value(),
+            duck_audio=self.duck_input.value(),
             blur_fill=self.blur_checkbox.isChecked(),
             blur_height=self.blur_height_spin.value(),
             blur_mode=self.blur_mode_combo.currentText(),
             cuda=self.cuda_checkbox.isChecked(),
-            output_dir=self.config.default_output_dir,
+            output_dir="",
         )
 
         self.worker = WorkerThread(settings, self.config)
@@ -851,19 +1396,75 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.log.connect(self.log_console.append)
         self.worker.finished.connect(self._handle_finished)
         self.worker.failed.connect(self._handle_failed)
+        self.worker.started.connect(self._start_timer)
         self.worker.start()
 
     def _handle_finished(self, output_path: str):
         self.status_label.setText("Done")
+        self._stop_timer()
         QtWidgets.QMessageBox.information(self, "Completed", f"Output saved to {output_path}")
 
     def _handle_failed(self, error: str):
         self.status_label.setText("Failed")
+        self._stop_timer()
         QtWidgets.QMessageBox.critical(self, "Error", error)
+
+    def _init_timer(self):
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick_timer)
+        self._elapsed_seconds = 0
+
+    def _start_timer(self):
+        self._elapsed_seconds = 0
+        self.processing_time_label.setText("Processing Time: 00:00")
+        self._timer.start()
+
+    def _tick_timer(self):
+        self._elapsed_seconds += 1
+        minutes, seconds = divmod(self._elapsed_seconds, 60)
+        self.processing_time_label.setText(f"Processing Time: {minutes:02d}:{seconds:02d}")
+
+    def _stop_timer(self):
+        self._timer.stop()
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    if not find_tool("ffmpeg") or not find_tool("ffprobe"):
+        progress = QtWidgets.QProgressDialog(
+            "Downloading essential components (FFmpeg)...",
+            None,
+            0,
+            0,
+        )
+        progress.setWindowTitle("Initializing")
+        progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.show()
+
+        loop = QtCore.QEventLoop()
+        downloader = DependencyDownloadThread()
+
+        def _finish():
+            loop.quit()
+
+        def _fail(message: str):
+            QtWidgets.QMessageBox.critical(
+                None,
+                "Dependency Error",
+                f"Failed to download FFmpeg: {message}",
+            )
+            loop.quit()
+
+        downloader.status.connect(progress.setLabelText)
+        downloader.finished.connect(_finish)
+        downloader.failed.connect(_fail)
+        downloader.start()
+        loop.exec()
+        progress.close()
+        if not find_tool("ffmpeg") or not find_tool("ffprobe"):
+            return
     config_manager = ConfigManager()
     window = MainWindow(config_manager)
     window.show()

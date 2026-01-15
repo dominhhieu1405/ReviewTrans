@@ -3,20 +3,18 @@
 ## 1. Install dependencies
 
 ```bash
-pip install pyinstaller PyQt6 requests edge-tts openai google-generativeai
+pip install pyinstaller PyQt6 requests edge-tts openai google-genai
 ```
 
 ## 2. Folder layout
 
-Ensure the following folders exist next to `video_translator_app.py`:
+Ensure the following folders exist next to `main.py`:
 
 ```
 bin/
   ffmpeg.exe
   ffprobe.exe
   whisper.exe
-models/
-  (whisper models auto-downloaded)
 ```
 
 > On macOS/Linux, use the appropriate binaries (no `.exe`) in `bin/`.
@@ -28,4 +26,3 @@ pyinstaller build.spec
 ```
 
 The output will be under `dist/VideoTranslationStudio`.
-
