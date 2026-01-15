@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import json
 import platform
 import shutil
 import subprocess
@@ -114,7 +115,7 @@ def download_ffmpeg(os_name: str, log_cb=None) -> Path:
     return bin_dir
 
 
-def run_subprocess(command: list[str], log_cb=None) -> int:
+def run_subprocess(command: list[str], log_cb=None, stop_event: threading.Event | None = None) -> int:
     if log_cb:
         log_cb(f"Running: {' '.join(command)}")
     process = subprocess.Popen(
@@ -125,11 +126,32 @@ def run_subprocess(command: list[str], log_cb=None) -> int:
         encoding="utf-8",
         errors="replace",
     )
+    stop_watcher = None
+    if stop_event is not None:
+        stop_watcher = threading.Thread(
+            target=_terminate_on_stop,
+            args=(process, stop_event),
+            daemon=True,
+        )
+        stop_watcher.start()
     if process.stdout:
         for line in process.stdout:
             if log_cb:
                 log_cb(line.rstrip())
-    return process.wait()
+    return_code = process.wait()
+    if stop_event is not None and stop_event.is_set():
+        return 1
+    return return_code
+
+
+def _terminate_on_stop(process: subprocess.Popen, stop_event: threading.Event) -> None:
+    stop_event.wait()
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
 
 
 def get_audio_duration(path: Path, ffprobe_path: Path) -> float:
@@ -304,8 +326,12 @@ class AppSettings:
     duck_audio: int
     blur_fill: bool
     blur_height: int
+    blur_padding: float
     blur_mode: str
     cuda: bool
+    watermark_top_left: str
+    watermark_top_right: str
+    flip_horizontal: bool
     output_dir: str
 
 
@@ -342,12 +368,17 @@ class DependencyDownloadThread(QtCore.QThread):
             self.failed.emit(str(exc))
 
 
+class StopProcessing(Exception):
+    pass
+
+
 class WorkerThread(QtCore.QThread):
     progress = QtCore.pyqtSignal(int)
     status = QtCore.pyqtSignal(str)
     log = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
+    stopped = QtCore.pyqtSignal()
 
     def __init__(self, settings: AppSettings, config: AppConfig, parent=None):
         super().__init__(parent)
@@ -361,11 +392,14 @@ class WorkerThread(QtCore.QThread):
     def run(self):
         try:
             self._run_pipeline()
+        except StopProcessing:
+            self.stopped.emit()
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
     def _run_pipeline(self):
         settings = self.settings
+        self._check_stop()
         if not settings.video_path:
             raise ValueError("Video path is required.")
 
@@ -380,6 +414,7 @@ class WorkerThread(QtCore.QThread):
 
         audio_path = work_dir / "audio.wav"
         self._step(5, "Extracting audio")
+        self._check_stop()
         extract_command = [
             str(ffmpeg_path),
             "-y",
@@ -395,12 +430,14 @@ class WorkerThread(QtCore.QThread):
         if settings.cuda:
             extract_command.insert(1, "-hwaccel")
             extract_command.insert(2, "cuda")
-        if run_subprocess(extract_command, self.log.emit) != 0:
+        if run_subprocess(extract_command, self.log.emit, self._stop_event) != 0:
+            self._check_stop()
             raise RuntimeError("FFmpeg audio extraction failed.")
 
         srt_path = None
         if settings.source_mode == "ASR":
             self._step(20, "Running ASR")
+            self._check_stop()
             whisper_path = find_tool("whisper")
             if not whisper_path:
                 raise FileNotFoundError("whisper executable not found in bin/ or tools/ folder.")
@@ -432,7 +469,8 @@ class WorkerThread(QtCore.QThread):
                     "-of",
                     str(work_dir / "transcript"),
                 ]
-                if run_subprocess(whisper_command, self.log.emit) != 0:
+                if run_subprocess(whisper_command, self.log.emit, self._stop_event) != 0:
+                    self._check_stop()
                     raise RuntimeError("Whisper ASR failed.")
                 shutil.copy2(srt_path, cached_asr)
         else:
@@ -441,6 +479,7 @@ class WorkerThread(QtCore.QThread):
             srt_path = Path(settings.srt_path)
 
         self._step(40, "Translating subtitles")
+        self._check_stop()
         with open(srt_path, "r", encoding="utf-8", errors="replace") as handle:
             source_content = handle.read()
         entries = parse_srt(source_content)
@@ -461,6 +500,7 @@ class WorkerThread(QtCore.QThread):
         tts_audio = None
         if settings.enable_tts:
             self._step(60, "Generating TTS")
+            self._check_stop()
             translated_text = "\n".join(entry["text"] for entry in translated_entries)
             tts_key = generate_cache_key(
                 translated_text,
@@ -487,27 +527,28 @@ class WorkerThread(QtCore.QThread):
                 self._apply_audio_fx(tts_audio, settings, ffmpeg_path)
 
         self._step(80, "Rendering output")
+        self._check_stop()
         video_height = get_video_height(Path(settings.video_path), ffprobe_path)
-        render_command = [
-            str(ffmpeg_path),
-            "-y",
-            "-i",
-            settings.video_path,
-        ]
+        watermark_paths = self._collect_watermark_paths(settings)
+        render_command = [str(ffmpeg_path), "-y", "-i", settings.video_path]
+        for watermark, _position in watermark_paths:
+            render_command += ["-i", str(watermark)]
         if tts_audio:
             render_command += ["-i", str(tts_audio)]
         video_filter_args = self._build_video_filter_args(
             translated_srt,
             settings,
             video_height,
+            watermark_paths,
         )
         render_command += video_filter_args
 
         has_video_map = "-map" in video_filter_args
+        tts_input_index = 1 + len(watermark_paths)
         if tts_audio:
             if not has_video_map:
                 render_command += ["-map", "0:v"]
-            render_command += ["-map", "1:a"]
+            render_command += ["-map", f"{tts_input_index}:a"]
         else:
             if not has_video_map:
                 render_command += ["-map", "0:v"]
@@ -523,15 +564,21 @@ class WorkerThread(QtCore.QThread):
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{Path(settings.video_path).stem}_translated.mp4"
         render_command.append(str(output_path))
-        if run_subprocess(render_command, self.log.emit) != 0:
+        if run_subprocess(render_command, self.log.emit, self._stop_event) != 0:
+            self._check_stop()
             raise RuntimeError("Video rendering failed.")
 
         self._step(100, "Completed")
         self.finished.emit(str(output_path))
 
     def _step(self, value: int, message: str):
+        self._check_stop()
         self.progress.emit(value)
         self.status.emit(message)
+
+    def _check_stop(self):
+        if self._stop_event.is_set():
+            raise StopProcessing
 
     def _translate_entries(self, entries: list[dict], settings: AppSettings) -> list[dict]:
         if settings.provider == "ChatGPT" and openai is None:
@@ -539,16 +586,37 @@ class WorkerThread(QtCore.QThread):
         if settings.provider == "Gemini" and genai is None:
             raise RuntimeError("google-genai package not installed.")
 
-        if settings.translate_all:
+        entry_count = len(entries)
+        if entry_count < 300:
+            self._check_stop()
             combined_text = "\n".join(entry["text"] for entry in entries)
             translated_text = self._translate_text(combined_text, settings)
             translated_lines = translated_text.splitlines()
             for idx, entry in enumerate(entries):
                 entry["text"] = translated_lines[idx] if idx < len(translated_lines) else entry["text"]
-        else:
-            for entry in entries:
-                entry["text"] = self._translate_text(entry["text"], settings)
+            return entries
+
+        for chunk in self._split_translation_chunks(entries):
+            self._check_stop()
+            combined_text = "\n".join(entry["text"] for entry in chunk)
+            translated_text = self._translate_text(combined_text, settings)
+            translated_lines = translated_text.splitlines()
+            for idx, entry in enumerate(chunk):
+                entry["text"] = translated_lines[idx] if idx < len(translated_lines) else entry["text"]
         return entries
+
+    def _split_translation_chunks(self, entries: list[dict]) -> list[list[dict]]:
+        chunks = []
+        index = 0
+        total = len(entries)
+        while index < total:
+            remaining = total - index
+            if remaining < 250:
+                chunks.append(entries[index:])
+                break
+            chunks.append(entries[index : index + 200])
+            index += 200
+        return chunks
 
     def _translate_text(self, text: str, settings: AppSettings) -> str:
         glossary = settings.glossary_instructions.strip()
@@ -603,6 +671,7 @@ class WorkerThread(QtCore.QThread):
     ):
         segment_paths = []
         for idx, entry in enumerate(entries, start=1):
+            self._check_stop()
             timestamps = entry["timestamps"].split(" --> ")
             if len(timestamps) != 2:
                 continue
@@ -711,7 +780,8 @@ class WorkerThread(QtCore.QThread):
             "44100",
             str(output_path),
         ]
-        if run_subprocess(convert_command, self.log.emit) != 0:
+        if run_subprocess(convert_command, self.log.emit, self._stop_event) != 0:
+            self._check_stop()
             raise RuntimeError("TTS audio conversion failed.")
         if temp_output.exists():
             temp_output.unlink()
@@ -747,6 +817,7 @@ class WorkerThread(QtCore.QThread):
             raise RuntimeError("vBee TTS missing request_id.")
 
         for _ in range(self.config.vbee_max_retries):
+            self._check_stop()
             time.sleep(1)
             poll_response = requests.get(
                 f"https://vbee.vn/api/v1/tts/{request_id}",
@@ -792,7 +863,8 @@ class WorkerThread(QtCore.QThread):
             filter_chain,
             str(adjusted_path),
         ]
-        if run_subprocess(command, self.log.emit) != 0:
+        if run_subprocess(command, self.log.emit, self._stop_event) != 0:
+            self._check_stop()
             raise RuntimeError("Audio time-stretch failed.")
         return adjusted_path
 
@@ -823,11 +895,13 @@ class WorkerThread(QtCore.QThread):
                 "44100",
                 str(base_audio),
             ]
-            if run_subprocess(base_command, self.log.emit) != 0:
+            if run_subprocess(base_command, self.log.emit, self._stop_event) != 0:
+                self._check_stop()
                 raise RuntimeError("Base audio generation failed.")
             temp_files.append(base_audio)
 
             for start in range(0, len(segment_paths), batch_size):
+                self._check_stop()
                 batch = segment_paths[start : start + batch_size]
                 command = [str(ffmpeg_path), "-y", "-i", str(base_audio)]
                 filter_parts = []
@@ -855,7 +929,8 @@ class WorkerThread(QtCore.QThread):
                     "44100",
                     str(temp_mix),
                 ]
-                if run_subprocess(command, self.log.emit) != 0:
+                if run_subprocess(command, self.log.emit, self._stop_event) != 0:
+                    self._check_stop()
                     raise RuntimeError("TTS segment mixing failed.")
                 shutil.move(temp_mix, base_audio)
 
@@ -870,7 +945,8 @@ class WorkerThread(QtCore.QThread):
                 "44100",
                 str(output_path),
             ]
-            if run_subprocess(final_command, self.log.emit) != 0:
+            if run_subprocess(final_command, self.log.emit, self._stop_event) != 0:
+                self._check_stop()
                 raise RuntimeError("Final audio export failed.")
         finally:
             for temp_file in temp_files + [temp_mix]:
@@ -893,7 +969,8 @@ class WorkerThread(QtCore.QThread):
             filter_chain,
             str(fx_output),
         ]
-        if run_subprocess(command, self.log.emit) != 0:
+        if run_subprocess(command, self.log.emit, self._stop_event) != 0:
+            self._check_stop()
             raise RuntimeError("Audio post-processing failed.")
         shutil.move(fx_output, audio_path)
 
@@ -924,36 +1001,69 @@ class WorkerThread(QtCore.QThread):
         color = "black"
         return f"drawbox=y=0:h=ih:color={color}:t=fill"
 
+    def _collect_watermark_paths(self, settings: AppSettings) -> list[tuple[Path, str]]:
+        paths = []
+        for label, raw_path, position in (
+            ("Top-Left", settings.watermark_top_left, "overlay=10:10"),
+            ("Top-Right", settings.watermark_top_right, "overlay=main_w-overlay_w-10:10"),
+        ):
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            if not path.exists():
+                self.log.emit(f"Watermark {label} not found: {path}")
+                continue
+            paths.append((path, position))
+        return paths
+
     def _build_video_filter_args(
         self,
-        srt_path: Path,
+        srt_path: Path | None,
         settings: AppSettings,
         video_height: int,
+        watermark_paths: list[tuple[Path, str]],
     ) -> list[str]:
         margin_v = int(video_height * 0.05) if video_height > 0 else 0
-        if not settings.blur_fill:
-            if settings.enable_subtitles:
-                return [
-                    "-vf",
-                    self._build_subtitle_filter(srt_path, settings, margin_v),
-                ]
+        subtitle_enabled = settings.enable_subtitles and srt_path and srt_path.exists()
+        use_complex = settings.blur_fill or settings.flip_horizontal or watermark_paths
+
+        if not use_complex and subtitle_enabled:
+            return ["-vf", self._build_subtitle_filter(srt_path, settings, margin_v)]
+        if not use_complex and not subtitle_enabled:
             return []
 
-        height_ratio = min(0.95, max(0.01, settings.blur_height / 100.0))
-        margin_ratio = 0.05
-        crop_h = f"ih*{height_ratio}"
-        crop_y = f"ih*{1 - margin_ratio - height_ratio}"
-        blur_filter = self._build_blur_filter(settings)
-        filter_parts = [
-            f"[0:v]crop=iw:{crop_h}:0:{crop_y}[bottom]",
-            f"[bottom]{blur_filter}[blurred]",
-            f"[0:v][blurred]overlay=0:main_h*{1 - margin_ratio - height_ratio}[bg_processed]",
-        ]
-        if settings.enable_subtitles:
+        filter_parts = []
+        current = "[0:v]"
+
+        if settings.flip_horizontal:
+            filter_parts.append(f"{current}hflip[vflip]")
+            current = "[vflip]"
+
+        if settings.blur_fill:
+            height_ratio = min(0.95, max(0.01, settings.blur_height / 100.0))
+            padding_ratio = max(0.0, settings.blur_padding / 100.0)
+            crop_h = f"ih*{height_ratio}"
+            crop_y = f"ih*(1-{height_ratio}-{padding_ratio})"
+            blur_filter = self._build_blur_filter(settings)
+            filter_parts.append(f"{current}crop=iw:{crop_h}:0:{crop_y}[bottom]")
+            filter_parts.append(f"[bottom]{blur_filter}[blurred]")
+            filter_parts.append(
+                f"{current}[blurred]overlay=0:ih*({1 - height_ratio - padding_ratio})[bg_processed]"
+            )
+            current = "[bg_processed]"
+
+        for idx, (_watermark_path, position) in enumerate(watermark_paths):
+            input_label = f"[{idx + 1}:v]"
+            next_label = f"[wm{idx}]"
+            filter_parts.append(f"{current}{input_label}{position}{next_label}")
+            current = next_label
+
+        if subtitle_enabled:
             subtitle_filter = self._build_subtitle_filter(srt_path, settings, margin_v)
-            filter_parts.append(f"[bg_processed]{subtitle_filter}[vout]")
+            filter_parts.append(f"{current}{subtitle_filter}[vout]")
         else:
-            filter_parts.append("[bg_processed]null[vout]")
+            filter_parts.append(f"{current}null[vout]")
+
         filter_complex = ";".join(filter_parts)
         return ["-filter_complex", filter_complex, "-map", "[vout]"]
 
@@ -1034,6 +1144,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config = config_manager.config
         self.worker = None
         self.model_fetch_thread = None
+        self._session_state = None
+        self._user_stop_requested = False
 
         self._build_menu()
         self._apply_theme()
@@ -1045,21 +1157,25 @@ class MainWindow(QtWidgets.QMainWindow):
         column_layout = QtWidgets.QHBoxLayout()
         main_layout.addLayout(column_layout)
 
-        column_layout.addWidget(self._build_input_column())
-        column_layout.addWidget(self._build_processing_column())
-        column_layout.addWidget(self._build_output_column())
+        column_layout.addWidget(self._build_left_column())
+        column_layout.addWidget(self._build_center_column())
+        column_layout.addWidget(self._build_right_column())
 
         self._update_source_mode()
         self._update_provider_models()
         self._load_defaults()
+        self.load_session_state()
         self._fetch_models_async()
         self._init_timer()
 
     def _build_menu(self):
         menu = self.menuBar().addMenu("Settings")
-        settings_action = QtGui.QAction("Preferences", self)
-        settings_action.triggered.connect(self._open_settings)
-        menu.addAction(settings_action)
+        self.settings_action = QtGui.QAction("Preferences", self)
+        self.settings_action.triggered.connect(self._open_settings)
+        menu.addAction(self.settings_action)
+        self.clear_temp_action = QtGui.QAction("Clear Temp Files", self)
+        self.clear_temp_action.triggered.connect(self._clear_temp_files)
+        menu.addAction(self.clear_temp_action)
 
     def _apply_theme(self):
         palette = QtGui.QPalette()
@@ -1074,17 +1190,28 @@ class MainWindow(QtWidgets.QMainWindow):
         palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
         self.setPalette(palette)
 
-    def _build_input_column(self):
-        group = QtWidgets.QGroupBox("Column 1: Input")
-        layout = QtWidgets.QVBoxLayout(group)
+    def _build_left_column(self):
+        self.left_column_group = QtWidgets.QGroupBox("Column 1: Configuration")
+        layout = QtWidgets.QVBoxLayout(self.left_column_group)
+        layout.addWidget(self._build_video_source_group())
+        layout.addWidget(self._build_asr_trans_group())
+        layout.addWidget(self._build_dubbing_watermark_group())
+        layout.addStretch()
+        return self.left_column_group
+
+    def _build_video_source_group(self):
+        self.video_source_group = QtWidgets.QGroupBox("Video Source")
+        layout = QtWidgets.QVBoxLayout(self.video_source_group)
 
         self.video_path_edit = QtWidgets.QLineEdit()
-        browse_button = QtWidgets.QPushButton("Browse Video")
-        browse_button.clicked.connect(self._browse_video)
+        self.video_browse_button = QtWidgets.QPushButton("Browse Video")
+        self.video_browse_button.clicked.connect(self._browse_video)
 
         video_layout = QtWidgets.QHBoxLayout()
         video_layout.addWidget(self.video_path_edit)
-        video_layout.addWidget(browse_button)
+        video_layout.addWidget(self.video_browse_button)
+        layout.addWidget(QtWidgets.QLabel("Video File"))
+        layout.addLayout(video_layout)
 
         source_group = QtWidgets.QGroupBox("Source Audio")
         source_layout = QtWidgets.QGridLayout(source_group)
@@ -1100,8 +1227,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_lang_combo.addItems(["auto", "en", "vi", "zh", "ja", "ko", "fr", "de", "es"])
 
         self.srt_path_edit = QtWidgets.QLineEdit()
-        srt_button = QtWidgets.QPushButton("Browse SRT")
-        srt_button.clicked.connect(self._browse_srt)
+        self.srt_browse_button = QtWidgets.QPushButton("Browse SRT")
+        self.srt_browse_button.clicked.connect(self._browse_srt)
 
         source_layout.addWidget(self.asr_radio, 0, 0, 1, 2)
         source_layout.addWidget(QtWidgets.QLabel("Whisper Model:"), 1, 0)
@@ -1110,17 +1237,14 @@ class MainWindow(QtWidgets.QMainWindow):
         source_layout.addWidget(self.source_lang_combo, 2, 1)
         source_layout.addWidget(self.srt_radio, 3, 0, 1, 2)
         source_layout.addWidget(self.srt_path_edit, 4, 0)
-        source_layout.addWidget(srt_button, 4, 1)
+        source_layout.addWidget(self.srt_browse_button, 4, 1)
 
-        layout.addWidget(QtWidgets.QLabel("Video File"))
-        layout.addLayout(video_layout)
         layout.addWidget(source_group)
-        layout.addStretch()
-        return group
+        return self.video_source_group
 
-    def _build_processing_column(self):
-        group = QtWidgets.QGroupBox("Column 2: Processing")
-        layout = QtWidgets.QVBoxLayout(group)
+    def _build_asr_trans_group(self):
+        self.asr_trans_group = QtWidgets.QGroupBox("ASR / Translation Settings")
+        layout = QtWidgets.QVBoxLayout(self.asr_trans_group)
 
         translation_group = QtWidgets.QGroupBox("Translation")
         translation_layout = QtWidgets.QGridLayout(translation_group)
@@ -1148,6 +1272,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "Enter translation rules or instructions here (free-form)."
         )
         glossary_layout.addWidget(self.glossary_text)
+
+        layout.addWidget(translation_group)
+        layout.addWidget(glossary_group)
+        return self.asr_trans_group
+
+    def _build_dubbing_watermark_group(self):
+        self.dubbing_group = QtWidgets.QGroupBox("Dubbing / Watermark Settings")
+        layout = QtWidgets.QVBoxLayout(self.dubbing_group)
 
         tts_group = QtWidgets.QGroupBox("Dubbing (TTS)")
         tts_layout = QtWidgets.QGridLayout(tts_group)
@@ -1179,18 +1311,77 @@ class MainWindow(QtWidgets.QMainWindow):
         tts_layout.addWidget(QtWidgets.QLabel("Pitch:"), 4, 0)
         tts_layout.addWidget(self.pitch_input, 4, 1)
 
-        layout.addWidget(translation_group)
-        layout.addWidget(glossary_group)
+        watermark_group = QtWidgets.QGroupBox("Watermarks & Effects")
+        watermark_layout = QtWidgets.QGridLayout(watermark_group)
+        self.watermark_top_left_edit = QtWidgets.QLineEdit()
+        self.watermark_top_left_button = QtWidgets.QPushButton("Browse")
+        self.watermark_top_left_button.clicked.connect(
+            lambda: self._browse_watermark(self.watermark_top_left_edit)
+        )
+        self.watermark_top_right_edit = QtWidgets.QLineEdit()
+        self.watermark_top_right_button = QtWidgets.QPushButton("Browse")
+        self.watermark_top_right_button.clicked.connect(
+            lambda: self._browse_watermark(self.watermark_top_right_edit)
+        )
+        self.flip_checkbox = QtWidgets.QCheckBox("Flip Video Horizontally")
+
+        watermark_layout.addWidget(QtWidgets.QLabel("Watermark Top-Left"), 0, 0)
+        watermark_layout.addWidget(self.watermark_top_left_edit, 0, 1)
+        watermark_layout.addWidget(self.watermark_top_left_button, 0, 2)
+        watermark_layout.addWidget(QtWidgets.QLabel("Watermark Top-Right"), 1, 0)
+        watermark_layout.addWidget(self.watermark_top_right_edit, 1, 1)
+        watermark_layout.addWidget(self.watermark_top_right_button, 1, 2)
+        watermark_layout.addWidget(self.flip_checkbox, 2, 0, 1, 3)
+
+        post_group = QtWidgets.QGroupBox("Post-Processing")
+        post_layout = QtWidgets.QGridLayout(post_group)
+        self.mute_radio = QtWidgets.QRadioButton("Mute Original")
+        self.duck_radio = QtWidgets.QRadioButton("Duck Audio")
+        self.mute_radio.setChecked(True)
+        self.duck_input = QtWidgets.QSpinBox()
+        self.duck_input.setRange(0, 100)
+        self.duck_input.setValue(30)
+        self.blur_checkbox = QtWidgets.QCheckBox("Blur/Fill Bottom")
+        self.blur_checkbox.setChecked(True)
+        self.blur_height_spin = QtWidgets.QSpinBox()
+        self.blur_height_spin.setRange(5, 50)
+        self.blur_height_spin.setValue(20)
+        self.blur_padding_spin = QtWidgets.QDoubleSpinBox()
+        self.blur_padding_spin.setRange(0.0, 20.0)
+        self.blur_padding_spin.setSingleStep(0.1)
+        self.blur_padding_spin.setValue(5.0)
+        self.blur_mode_combo = QtWidgets.QComboBox()
+        self.blur_mode_combo.addItems(["Blur", "Solid Color Fill"])
+        self.cuda_checkbox = QtWidgets.QCheckBox("Enable CUDA Acceleration")
+
+        post_layout.addWidget(self.mute_radio, 0, 0)
+        post_layout.addWidget(self.duck_radio, 0, 1)
+        post_layout.addWidget(QtWidgets.QLabel("Duck Volume:"), 1, 0)
+        post_layout.addWidget(self.duck_input, 1, 1)
+        post_layout.addWidget(self.blur_checkbox, 2, 0, 1, 2)
+        post_layout.addWidget(QtWidgets.QLabel("Height %:"), 3, 0)
+        post_layout.addWidget(self.blur_height_spin, 3, 1)
+        post_layout.addWidget(QtWidgets.QLabel("Blur Bottom Padding (%):"), 4, 0)
+        post_layout.addWidget(self.blur_padding_spin, 4, 1)
+        post_layout.addWidget(self.blur_mode_combo, 5, 0, 1, 2)
+        post_layout.addWidget(self.cuda_checkbox, 6, 0, 1, 2)
+
         layout.addWidget(tts_group)
+        layout.addWidget(watermark_group)
+        layout.addWidget(post_group)
+        return self.dubbing_group
+
+    def _build_center_column(self):
+        self.center_column_group = QtWidgets.QGroupBox("Column 2: Visuals")
+        layout = QtWidgets.QVBoxLayout(self.center_column_group)
+        layout.addWidget(self._build_subtitle_group())
+        layout.addWidget(self._build_preview_group())
         layout.addStretch()
-        return group
+        return self.center_column_group
 
-    def _build_output_column(self):
-        group = QtWidgets.QGroupBox("Column 3: Output / Preview")
-        layout = QtWidgets.QVBoxLayout(group)
-
-        subtitle_group = QtWidgets.QGroupBox("Subtitles")
-        subtitle_layout = QtWidgets.QGridLayout(subtitle_group)
+    def _build_subtitle_group(self):
+        self.subtitle_group = QtWidgets.QGroupBox("Subtitles")
+        subtitle_layout = QtWidgets.QGridLayout(self.subtitle_group)
         self.subtitle_enable_checkbox = QtWidgets.QCheckBox("Enable Subtitles")
         self.font_family_combo = QtWidgets.QComboBox()
         self.font_family_combo.addItems(QtGui.QFontDatabase.families())
@@ -1219,37 +1410,33 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle_layout.addWidget(QtWidgets.QLabel("Position:"), 6, 0)
         subtitle_layout.addWidget(self.position_combo, 6, 1)
 
-        post_group = QtWidgets.QGroupBox("Post-Processing")
-        post_layout = QtWidgets.QGridLayout(post_group)
-        self.mute_radio = QtWidgets.QRadioButton("Mute Original")
-        self.duck_radio = QtWidgets.QRadioButton("Duck Audio")
-        self.mute_radio.setChecked(True)
-        self.duck_input = QtWidgets.QSpinBox()
-        self.duck_input.setRange(0, 100)
-        self.duck_input.setValue(30)
-        self.blur_checkbox = QtWidgets.QCheckBox("Blur/Fill Bottom")
-        self.blur_checkbox.setChecked(True)
-        self.blur_height_spin = QtWidgets.QSpinBox()
-        self.blur_height_spin.setRange(5, 50)
-        self.blur_height_spin.setValue(20)
-        self.blur_mode_combo = QtWidgets.QComboBox()
-        self.blur_mode_combo.addItems(["Blur", "Solid Color Fill"])
-        self.cuda_checkbox = QtWidgets.QCheckBox("Enable CUDA Acceleration")
+        return self.subtitle_group
 
-        post_layout.addWidget(self.mute_radio, 0, 0)
-        post_layout.addWidget(self.duck_radio, 0, 1)
-        post_layout.addWidget(QtWidgets.QLabel("Duck Volume:"), 1, 0)
-        post_layout.addWidget(self.duck_input, 1, 1)
-        post_layout.addWidget(self.blur_checkbox, 2, 0)
-        post_layout.addWidget(QtWidgets.QLabel("Height %:"), 3, 0)
-        post_layout.addWidget(self.blur_height_spin, 3, 1)
-        post_layout.addWidget(self.blur_mode_combo, 4, 0, 1, 2)
-        post_layout.addWidget(self.cuda_checkbox, 5, 0, 1, 2)
+    def _build_preview_group(self):
+        self.preview_group = QtWidgets.QGroupBox("Preview")
+        layout = QtWidgets.QVBoxLayout(self.preview_group)
+        self.preview_button = QtWidgets.QPushButton("Generate Preview")
+        self.preview_button.clicked.connect(self._generate_preview)
+        self.preview_label = QtWidgets.QLabel("Preview will appear here.")
+        self.preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumHeight(240)
+        self.preview_label.setStyleSheet("border: 1px solid #444444;")
+        layout.addWidget(self.preview_button)
+        layout.addWidget(self.preview_label)
+        return self.preview_group
 
-        execution_group = QtWidgets.QGroupBox("Execution & Status")
-        execution_layout = QtWidgets.QVBoxLayout(execution_group)
+    def _build_right_column(self):
+        self.right_column_group = QtWidgets.QGroupBox("Column 3: Monitor")
+        layout = QtWidgets.QVBoxLayout(self.right_column_group)
+        layout.addWidget(self._build_execution_group())
+        return self.right_column_group
+
+    def _build_execution_group(self):
+        self.execution_group = QtWidgets.QGroupBox("Execution Status")
+        execution_layout = QtWidgets.QVBoxLayout(self.execution_group)
         self.start_button = QtWidgets.QPushButton("Start")
-        self.start_button.clicked.connect(self._start_processing)
+        self.start_button.clicked.connect(self._toggle_processing)
+        self._start_button_default_style = self.start_button.styleSheet()
         self.progress_bar = QtWidgets.QProgressBar()
         self.status_label = QtWidgets.QLabel("Idle")
         self.processing_time_label = QtWidgets.QLabel("Processing Time: 00:00")
@@ -1261,11 +1448,7 @@ class MainWindow(QtWidgets.QMainWindow):
         execution_layout.addWidget(self.status_label)
         execution_layout.addWidget(self.processing_time_label)
         execution_layout.addWidget(self.log_console)
-
-        layout.addWidget(subtitle_group)
-        layout.addWidget(post_group)
-        layout.addWidget(execution_group)
-        return group
+        return self.execution_group
 
     def _load_defaults(self):
         self.target_lang_combo.setCurrentText(self.config.default_target_language)
@@ -1296,6 +1479,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.model_combo.addItem("No models found")
             return
         self.model_combo.addItems(models)
+        if self._session_state:
+            self._set_combo_value(self.model_combo, self._session_state)
+            self._session_state = None
 
     def _log_model_error(self, error: str):
         self.log_console.append(f"Model fetch failed: {error}")
@@ -1307,6 +1493,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_combo.setEnabled(asr_enabled)
         self.source_lang_combo.setEnabled(asr_enabled)
         self.srt_path_edit.setEnabled(not asr_enabled)
+        self.srt_browse_button.setEnabled(not asr_enabled)
 
     def _update_provider_models(self):
         provider = self.provider_combo.currentText()
@@ -1342,24 +1529,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             self.srt_path_edit.setText(path)
 
+    def _browse_watermark(self, target_edit: QtWidgets.QLineEdit):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Watermark Image",
+            "",
+            "Image Files (*.png *.jpg *.jpeg *.webp)",
+        )
+        if path:
+            target_edit.setText(path)
+
     def _select_color(self):
         color = QtWidgets.QColorDialog.getColor()
         if color.isValid():
             self.text_color_display.setText(color.name())
 
-    def _start_processing(self):
-        if self.worker and self.worker.isRunning():
-            QtWidgets.QMessageBox.warning(self, "Busy", "Processing already running.")
-            return
-        if self.tts_provider_combo.currentText() == "Custom API" and not self.config.custom_tts_url:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Missing Configuration",
-                "Please configure the Custom TTS Endpoint in Settings.",
-            )
-            return
+    def _clear_temp_files(self):
+        temp_dir = get_resource_path("tmp")
+        try:
+            if temp_dir.exists():
+                for item in temp_dir.iterdir():
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            QtWidgets.QMessageBox.information(self, "Success", "Temporary files cleared.")
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to clear temp files: {exc}")
 
-        settings = AppSettings(
+    def _build_settings(self) -> AppSettings:
+        return AppSettings(
             video_path=self.video_path_edit.text().strip(),
             source_mode="ASR" if self.asr_radio.isChecked() else "SRT",
             whisper_model=self.model_combo.currentText(),
@@ -1385,10 +1585,199 @@ class MainWindow(QtWidgets.QMainWindow):
             duck_audio=self.duck_input.value(),
             blur_fill=self.blur_checkbox.isChecked(),
             blur_height=self.blur_height_spin.value(),
+            blur_padding=self.blur_padding_spin.value(),
             blur_mode=self.blur_mode_combo.currentText(),
             cuda=self.cuda_checkbox.isChecked(),
+            watermark_top_left=self.watermark_top_left_edit.text().strip(),
+            watermark_top_right=self.watermark_top_right_edit.text().strip(),
+            flip_horizontal=self.flip_checkbox.isChecked(),
             output_dir="",
         )
+
+    def _collect_watermark_paths(self) -> list[tuple[Path, str]]:
+        paths = []
+        for label, raw_path, position in (
+            ("Top-Left", self.watermark_top_left_edit.text().strip(), "overlay=10:10"),
+            (
+                "Top-Right",
+                self.watermark_top_right_edit.text().strip(),
+                "overlay=main_w-overlay_w-10:10",
+            ),
+        ):
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            if not path.exists():
+                self.log_console.append(f"Watermark {label} not found: {path}")
+                continue
+            paths.append((path, position))
+        return paths
+
+    def _generate_preview(self):
+        settings = self._build_settings()
+        if not settings.video_path:
+            QtWidgets.QMessageBox.warning(self, "Missing Video", "Please select a video file.")
+            return
+        video_path = Path(settings.video_path)
+        if not video_path.exists():
+            QtWidgets.QMessageBox.warning(self, "Missing Video", "Selected video file not found.")
+            return
+        ffmpeg_path = find_tool("ffmpeg")
+        ffprobe_path = find_tool("ffprobe")
+        if not ffmpeg_path or not ffprobe_path:
+            QtWidgets.QMessageBox.warning(self, "Missing Tools", "ffmpeg/ffprobe not found.")
+            return
+
+        duration = get_video_duration(video_path, ffprobe_path)
+        seek_time = max(0.0, duration / 2.0)
+        watermark_paths = self._collect_watermark_paths()
+
+        preview_dir = get_resource_path("tmp")
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        preview_path = preview_dir / "preview_frame.jpg"
+
+        command = [str(ffmpeg_path), "-y", "-ss", f"{seek_time:.2f}", "-i", str(video_path)]
+        for watermark, _position in watermark_paths:
+            command += ["-i", str(watermark)]
+        command += ["-vframes", "1"]
+
+        video_height = get_video_height(video_path, ffprobe_path)
+        srt_path = Path(settings.srt_path) if settings.srt_path else None
+        filter_args = self._build_preview_filter_args(
+            srt_path,
+            settings,
+            video_height,
+            watermark_paths,
+        )
+        command += filter_args
+        command.append(str(preview_path))
+
+        if run_subprocess(command, self.log_console.append) != 0:
+            QtWidgets.QMessageBox.critical(self, "Preview Error", "Failed to generate preview.")
+            return
+        pixmap = QtGui.QPixmap(str(preview_path))
+        if pixmap.isNull():
+            QtWidgets.QMessageBox.warning(self, "Preview Error", "Preview image could not be loaded.")
+            return
+        scaled = pixmap.scaled(
+            self.preview_label.width(),
+            self.preview_label.height(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(scaled)
+
+    def _build_preview_subtitle_filter(
+        self,
+        srt_path: Path,
+        settings: AppSettings,
+        margin_v: int,
+    ) -> str:
+        alignment = {"Bottom": "2", "Center": "5", "Top": "8"}.get(settings.position, "2")
+        style = (
+            f"FontName={settings.font_family},"
+            f"FontSize={settings.font_size},"
+            f"PrimaryColour=&H{settings.text_color.lstrip('#')},"
+            f"Outline={settings.border_width},"
+            f"Alignment={alignment},"
+            f"MarginV={margin_v}"
+        )
+        safe_path = escape_ffmpeg_path(str(srt_path))
+        return f"subtitles='{safe_path}':force_style='{style}'"
+
+    def _build_preview_blur_filter(self, settings: AppSettings) -> str:
+        if settings.blur_mode == "Blur":
+            return (
+                "boxblur=luma_radius=10:luma_power=1:"
+                "chroma_radius=10:chroma_power=1"
+            )
+        color = "black"
+        return f"drawbox=y=0:h=ih:color={color}:t=fill"
+
+    def _build_preview_filter_args(
+        self,
+        srt_path: Path | None,
+        settings: AppSettings,
+        video_height: int,
+        watermark_paths: list[tuple[Path, str]],
+    ) -> list[str]:
+        margin_v = int(video_height * 0.05) if video_height > 0 else 0
+        subtitle_enabled = settings.enable_subtitles and srt_path and srt_path.exists()
+        use_complex = settings.blur_fill or settings.flip_horizontal or watermark_paths
+
+        if not use_complex and subtitle_enabled:
+            return ["-vf", self._build_preview_subtitle_filter(srt_path, settings, margin_v)]
+        if not use_complex and not subtitle_enabled:
+            return []
+
+        filter_parts = []
+        current = "[0:v]"
+
+        if settings.flip_horizontal:
+            filter_parts.append(f"{current}hflip[vflip]")
+            current = "[vflip]"
+
+        if settings.blur_fill:
+            height_ratio = min(0.95, max(0.01, settings.blur_height / 100.0))
+            padding_ratio = max(0.0, settings.blur_padding / 100.0)
+            crop_h = f"ih*{height_ratio}"
+            crop_y = f"ih*(1-{height_ratio}-{padding_ratio})"
+            blur_filter = self._build_preview_blur_filter(settings)
+            filter_parts.append(f"{current}crop=iw:{crop_h}:0:{crop_y}[bottom]")
+            filter_parts.append(f"[bottom]{blur_filter}[blurred]")
+            filter_parts.append(
+                f"{current}[blurred]overlay=0:ih*({1 - height_ratio - padding_ratio})[bg_processed]"
+            )
+            current = "[bg_processed]"
+
+        for idx, (_watermark_path, position) in enumerate(watermark_paths):
+            input_label = f"[{idx + 1}:v]"
+            next_label = f"[wm{idx}]"
+            filter_parts.append(f"{current}{input_label}{position}{next_label}")
+            current = next_label
+
+        if subtitle_enabled:
+            subtitle_filter = self._build_preview_subtitle_filter(srt_path, settings, margin_v)
+            filter_parts.append(f"{current}{subtitle_filter}[vout]")
+        else:
+            filter_parts.append(f"{current}null[vout]")
+
+        filter_complex = ";".join(filter_parts)
+        return ["-filter_complex", filter_complex, "-map", "[vout]"]
+
+    def _toggle_processing(self):
+        if self.worker and self.worker.isRunning():
+            self._stop_processing()
+            return
+        self._start_processing()
+
+    def _stop_processing(self):
+        if not self.worker or not self.worker.isRunning():
+            return
+        self._user_stop_requested = True
+        self.worker.stop()
+        self.worker.wait(500)
+        if self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(1000)
+        self._set_running_state(False)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Stopped")
+        self._stop_timer()
+        self.log_console.append("Process stopped by user.")
+
+    def _start_processing(self):
+        self._user_stop_requested = False
+        if self.tts_provider_combo.currentText() == "Custom API" and not self.config.custom_tts_url:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing Configuration",
+                "Please configure the Custom TTS Endpoint in Settings.",
+            )
+            return
+
+        self.save_session_state()
+        settings = self._build_settings()
 
         self.worker = WorkerThread(settings, self.config)
         self.worker.progress.connect(self.progress_bar.setValue)
@@ -1396,18 +1785,51 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.log.connect(self.log_console.append)
         self.worker.finished.connect(self._handle_finished)
         self.worker.failed.connect(self._handle_failed)
+        self.worker.stopped.connect(self._handle_stopped)
         self.worker.started.connect(self._start_timer)
+        self._set_running_state(True)
         self.worker.start()
 
     def _handle_finished(self, output_path: str):
         self.status_label.setText("Done")
         self._stop_timer()
+        self._set_running_state(False)
+        self._user_stop_requested = False
         QtWidgets.QMessageBox.information(self, "Completed", f"Output saved to {output_path}")
 
     def _handle_failed(self, error: str):
         self.status_label.setText("Failed")
         self._stop_timer()
+        self._set_running_state(False)
+        self._user_stop_requested = False
         QtWidgets.QMessageBox.critical(self, "Error", error)
+
+    def _handle_stopped(self):
+        self.status_label.setText("Stopped")
+        self.progress_bar.setValue(0)
+        self._stop_timer()
+        self._set_running_state(False)
+        if not self._user_stop_requested:
+            self.log_console.append("Process stopped by user.")
+        self._user_stop_requested = False
+
+    def _set_running_state(self, running: bool):
+        if running:
+            self.start_button.setText("Stop")
+            self.start_button.setStyleSheet("background-color: #c62828; color: #ffffff;")
+        else:
+            self.start_button.setText("Start")
+            self.start_button.setStyleSheet(self._start_button_default_style)
+        for group in (
+            self.video_source_group,
+            self.asr_trans_group,
+            self.dubbing_group,
+            self.subtitle_group,
+            self.preview_group,
+        ):
+            group.setEnabled(not running)
+        self.settings_action.setEnabled(not running)
+        self.clear_temp_action.setEnabled(not running)
 
     def _init_timer(self):
         self._timer = QtCore.QTimer(self)
@@ -1427,6 +1849,126 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _stop_timer(self):
         self._timer.stop()
+
+    def _session_config_path(self) -> Path:
+        base_dir = self.config_manager.config_path.parent
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir / "session_config.json"
+
+    def save_session_state(self) -> None:
+        video_path = self.video_path_edit.text().strip()
+        if video_path:
+            self.config.last_opened_directory = str(Path(video_path).parent)
+        data = {
+            "video_path": video_path,
+            "source_mode": "ASR" if self.asr_radio.isChecked() else "SRT",
+            "whisper_model": self.model_combo.currentText(),
+            "source_language": self.source_lang_combo.currentText(),
+            "provider": self.provider_combo.currentText(),
+            "provider_model": self.model_combo_provider.currentText(),
+            "target_language": self.target_lang_combo.currentText(),
+            "translate_all": self.translate_all_checkbox.isChecked(),
+            "glossary": self.glossary_text.toPlainText(),
+            "enable_tts": self.tts_enable_checkbox.isChecked(),
+            "tts_provider": self.tts_provider_combo.currentText(),
+            "force_audio_sync": self.force_sync_checkbox.isChecked(),
+            "speed": self.speed_input.value(),
+            "pitch": float(self.pitch_input.value()),
+            "enable_subtitles": self.subtitle_enable_checkbox.isChecked(),
+            "font_family": self.font_family_combo.currentText(),
+            "font_size": self.font_size_spin.value(),
+            "text_color": self.text_color_display.text(),
+            "border_width": self.border_width_spin.value(),
+            "position": self.position_combo.currentText(),
+            "mute_original": self.mute_radio.isChecked(),
+            "duck_audio": self.duck_input.value(),
+            "blur_fill": self.blur_checkbox.isChecked(),
+            "blur_height": self.blur_height_spin.value(),
+            "blur_padding": self.blur_padding_spin.value(),
+            "blur_mode": self.blur_mode_combo.currentText(),
+            "cuda": self.cuda_checkbox.isChecked(),
+            "watermark_top_left": self.watermark_top_left_edit.text(),
+            "watermark_top_right": self.watermark_top_right_edit.text(),
+            "flip_horizontal": self.flip_checkbox.isChecked(),
+            "last_opened_directory": self.config.last_opened_directory,
+            "config": {
+                "openai_api_key": self.config.openai_api_key,
+                "gemini_api_key": self.config.gemini_api_key,
+                "custom_tts_key": self.config.custom_tts_key,
+                "custom_tts_url": self.config.custom_tts_url,
+                "vbee_app_id": self.config.vbee_app_id,
+                "vbee_token": self.config.vbee_token,
+                "vbee_voice_code": self.config.vbee_voice_code,
+                "vbee_max_retries": self.config.vbee_max_retries,
+            },
+        }
+        session_path = self._session_config_path()
+        with session_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+
+    def load_session_state(self) -> None:
+        session_path = self._session_config_path()
+        if not session_path.exists():
+            return
+        with session_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        self.video_path_edit.setText(data.get("video_path", ""))
+        source_mode = data.get("source_mode", "ASR")
+        self.asr_radio.setChecked(source_mode == "ASR")
+        self.srt_radio.setChecked(source_mode == "SRT")
+        self.srt_path_edit.setText("")
+        self.source_lang_combo.setCurrentText(data.get("source_language", "auto"))
+        self.provider_combo.setCurrentText(data.get("provider", "Gemini"))
+        self._update_provider_models()
+        self._set_combo_value(self.model_combo_provider, data.get("provider_model", ""))
+        self.target_lang_combo.setCurrentText(data.get("target_language", "vi"))
+        self.translate_all_checkbox.setChecked(data.get("translate_all", False))
+        self.glossary_text.setPlainText(data.get("glossary", ""))
+        self.tts_enable_checkbox.setChecked(data.get("enable_tts", False))
+        self.tts_provider_combo.setCurrentText(data.get("tts_provider", "Edge TTS"))
+        self.force_sync_checkbox.setChecked(data.get("force_audio_sync", True))
+        self.speed_input.setValue(float(data.get("speed", 1.0)))
+        self.pitch_input.setValue(float(data.get("pitch", 0.0)))
+        self.subtitle_enable_checkbox.setChecked(data.get("enable_subtitles", True))
+        self._set_combo_value(self.font_family_combo, data.get("font_family", ""))
+        self.font_size_spin.setValue(int(data.get("font_size", 16)))
+        self.text_color_display.setText(data.get("text_color", "#FFFFFF"))
+        self.border_width_spin.setValue(int(data.get("border_width", 2)))
+        self.position_combo.setCurrentText(data.get("position", "Bottom"))
+        self.mute_radio.setChecked(data.get("mute_original", True))
+        self.duck_radio.setChecked(not data.get("mute_original", True))
+        self.duck_input.setValue(int(data.get("duck_audio", 30)))
+        self.blur_checkbox.setChecked(data.get("blur_fill", True))
+        self.blur_height_spin.setValue(int(data.get("blur_height", 20)))
+        self.blur_padding_spin.setValue(float(data.get("blur_padding", 5.0)))
+        self.blur_mode_combo.setCurrentText(data.get("blur_mode", "Blur"))
+        self.cuda_checkbox.setChecked(data.get("cuda", False))
+        self.watermark_top_left_edit.setText(data.get("watermark_top_left", ""))
+        self.watermark_top_right_edit.setText(data.get("watermark_top_right", ""))
+        self.flip_checkbox.setChecked(data.get("flip_horizontal", False))
+        self.config.last_opened_directory = data.get("last_opened_directory", "")
+        config_data = data.get("config", {})
+        self.config.openai_api_key = config_data.get("openai_api_key", self.config.openai_api_key)
+        self.config.gemini_api_key = config_data.get("gemini_api_key", self.config.gemini_api_key)
+        self.config.custom_tts_key = config_data.get("custom_tts_key", self.config.custom_tts_key)
+        self.config.custom_tts_url = config_data.get("custom_tts_url", self.config.custom_tts_url)
+        self.config.vbee_app_id = config_data.get("vbee_app_id", self.config.vbee_app_id)
+        self.config.vbee_token = config_data.get("vbee_token", self.config.vbee_token)
+        self.config.vbee_voice_code = config_data.get(
+            "vbee_voice_code",
+            self.config.vbee_voice_code,
+        )
+        self.config.vbee_max_retries = int(
+            config_data.get("vbee_max_retries", self.config.vbee_max_retries)
+        )
+        self._session_state = data.get("whisper_model")
+
+    def _set_combo_value(self, combo: QtWidgets.QComboBox, value: str) -> None:
+        if not value:
+            return
+        index = combo.findText(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
 
 
 def main():
