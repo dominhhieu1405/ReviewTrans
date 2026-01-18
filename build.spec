@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-app_dir = Path(__file__).resolve().parent
+app_dir = Path(SPECPATH)
 
 block_cipher = None
 
@@ -32,6 +32,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     name="VideoTranslationStudio",
+    icon=str(app_dir / 'dist' / 'icon.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

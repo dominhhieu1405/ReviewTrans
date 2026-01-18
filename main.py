@@ -28,11 +28,17 @@ SUPPORTED_VIDEO_EXTENSIONS = "*.mp4 *.mkv *.avi *.mov"
 
 OPENAI_MODELS = ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
 GEMINI_MODELS = [
-    "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-flash-latest",
 ]
+
+def rgb_hex_to_ass_bgr(hex_rgb: str) -> str:
+    s = hex_rgb.strip().lstrip("#")
+    if len(s) != 6:
+        raise ValueError("Color must be #RRGGBB")
+    r, g, b = s[0:2], s[2:4], s[4:6]
+    return f"#{b}{g}{r}"  # &H00BBGGRR
 
 
 def optional_import(name: str):
@@ -236,6 +242,12 @@ def get_video_height(path: Path, ffprobe_path: Path) -> int:
         return 0
 
 
+def compute_subtitle_margin(video_height: int, padding_percent: float) -> int:
+    base_height = video_height if video_height > 0 else 1080
+    ratio = max(0.0, padding_percent / 100.0)
+    return max(0, int(base_height * ratio))
+
+
 def fetch_whisper_models(log_cb=None) -> list[str]:
     url = f"https://huggingface.co/api/models/{WHISPER_REPO}"
     if log_cb:
@@ -321,7 +333,7 @@ class AppSettings:
     font_size: int
     text_color: str
     border_width: int
-    position: str
+    subtitle_bottom_padding: float
     mute_original: bool
     duck_audio: int
     blur_fill: bool
@@ -499,7 +511,7 @@ class WorkerThread(QtCore.QThread):
             translated_entries = self._translate_entries(entries, settings)
             with open(translated_srt, "w", encoding="utf-8", errors="replace") as handle:
                 handle.write(render_srt(translated_entries))
-        translated_output = output_dir / f"trans_{video_stem}.srt"
+        translated_output = output_dir / f"trans_{video_stem}.vi_VN.srt"
         final_subtitle_output = output_dir / f"sub_{video_stem}.srt"
         translated_content = render_srt(translated_entries)
         translated_output.write_text(translated_content, encoding="utf-8")
@@ -631,14 +643,26 @@ class WorkerThread(QtCore.QThread):
             "CONSTRAINT: You are translating for Movie Dubbing. The translated text must "
             "be concise and match the spoken duration of the original text as closely as "
             "possible. Avoid wordy explanations or expansions. Choose shorter synonyms "
-            "where possible. If the source sentence is short (e.g., 'No.'), the target must "
-            "be short (e.g., 'Không.'). Do not make it 'Tôi không đồng ý với điều đó.' "
-            "unless necessary for context.\n"
-            "RULE: If a sentence translates to a single word (e.g., 'Không', 'Được'), you "
-            "MUST merge it into the previous or next sentence, whichever fits the context "
-            "better. Ensure every translated segment has at least 2 words or is "
-            "grammatically complete."
+            "where possible.\n"
+
+            "SUBTITLE INTEGRITY RULE (STRICT):\n"
+            "- You MUST translate each subtitle line independently.\n"
+            "- You MUST preserve the original number of subtitle entries exactly.\n"
+            "- NEVER merge multiple subtitles into one.\n"
+            "- NEVER split one subtitle into multiple subtitles.\n"
+            "- NEVER delete, skip, or add subtitle entries.\n"
+            "- Keep the original subtitle order unchanged.\n"
+
+            "If the source sentence is short (e.g., 'No.'), the target must be short "
+            "(e.g., 'Không.'). Do NOT expand it into a longer sentence unless absolutely "
+            "required by context.\n"
+
+            "OUTPUT FORMAT RULE:\n"
+            "- Output MUST contain exactly the same number of lines as the input.\n"
+            "- Each output line corresponds 1-to-1 with the input subtitle line.\n"
+            "- Do NOT add extra lines, comments, or explanations.\n"
         )
+
         if glossary:
             system_instructions += f"\nAdditional instructions:\n{glossary}"
         prompt = (
@@ -684,12 +708,23 @@ class WorkerThread(QtCore.QThread):
             start_time = parse_timestamp(timestamps[0])
             end_time = parse_timestamp(timestamps[1])
             max_duration = max(0.1, end_time - start_time)
-            raw_path = self._generate_tts_segment(
-                entry["text"],
-                idx,
-                cache_dir,
-                ffmpeg_path,
-            )
+            print("Generating:", entry["text"])
+            print(" - Data:", entry)
+            try:
+                raw_path = self._generate_tts_segment(
+                    entry["text"],
+                    idx,
+                    cache_dir,
+                    ffmpeg_path,
+                )
+            except:
+                raw_path = self._generate_tts_segment(
+                    entry["text"] + " @",
+                    idx,
+                    cache_dir,
+                    ffmpeg_path,
+                )
+
             adjusted_path = raw_path
             if force_audio_sync:
                 adjusted_path = self._fit_audio_to_slot(
@@ -737,6 +772,24 @@ class WorkerThread(QtCore.QThread):
             async def _run():
                 communicate = edge_tts.Communicate(text, self.settings.target_language)
                 await communicate.save(str(temp_output))
+                speed = max(0.5, min(2.0, float(self.settings.speed)))
+                if abs(speed - 1.0) > 1e-6:
+                    sped_mp3 = temp_output.with_name(f"{temp_output.stem}_spd{speed:.2f}.mp3")
+
+                    cmd = [
+                        str(ffmpeg_path),
+                        "-y",
+                        "-i", str(temp_output),
+                        "-filter:a", f"atempo={speed}",
+                        str(sped_mp3),
+                    ]
+                    if run_subprocess(cmd, self.log.emit, self._stop_event) != 0:
+                        self._check_stop()
+                        raise RuntimeError("TTS segment speed processing failed (mp3).")
+
+                    # replace the original temp_output with sped version
+                    temp_output.unlink(missing_ok=True)
+                    sped_mp3.replace(temp_output)
 
             thread = threading.Thread(target=lambda: asyncio.run(_run()), daemon=True)
             thread.start()
@@ -765,6 +818,22 @@ class WorkerThread(QtCore.QThread):
             )
             response.raise_for_status()
             data = response.json()
+
+            if data.get("code") == 9:
+                payload = {
+                    "text": text + " @",
+                    "language": self.settings.target_language,
+                }
+                response = requests.post(
+                    self.config.custom_tts_url,
+                    data=payload,
+                    headers=headers,
+                    timeout=60,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+
             if data.get("code") != 0:
                 raise RuntimeError(f"Custom API failed: {data.get('msg')}")
             audio_url = data.get("data")
@@ -774,6 +843,25 @@ class WorkerThread(QtCore.QThread):
             audio_response.raise_for_status()
             with open(temp_output, "wb") as handle:
                 handle.write(audio_response.content)
+
+            speed = max(0.5, min(2.0, float(self.settings.speed)))
+            if abs(speed - 1.0) > 1e-6:
+                sped_mp3 = temp_output.with_name(f"{temp_output.stem}_spd{speed:.2f}.mp3")
+
+                cmd = [
+                    str(ffmpeg_path),
+                    "-y",
+                    "-i", str(temp_output),
+                    "-filter:a", f"atempo={speed}",
+                    str(sped_mp3),
+                ]
+                if run_subprocess(cmd, self.log.emit, self._stop_event) != 0:
+                    self._check_stop()
+                    raise RuntimeError("TTS segment speed processing failed (mp3).")
+
+                # replace the original temp_output with sped version
+                temp_output.unlink(missing_ok=True)
+                sped_mp3.replace(temp_output)
 
         convert_command = [
             str(ffmpeg_path),
@@ -960,12 +1048,15 @@ class WorkerThread(QtCore.QThread):
                     temp_file.unlink()
 
     def _apply_audio_fx(self, audio_path: Path, settings: AppSettings, ffmpeg_path: Path):
-        if settings.speed == 1.0 and settings.pitch == 0.0:
+        if settings.pitch == 0.0:
             return
         fx_output = audio_path.with_name("tts_audio_fx.wav")
-        atempo = max(0.5, min(2.0, settings.speed))
+        # atempo = max(0.5, min(2.0, settings.speed))
+        atempo = 1.0
         pitch_ratio = 2 ** (settings.pitch / 12.0)
-        filter_chain = f"asetrate=44100*{pitch_ratio},atempo={atempo}"
+        # filter_chain = f"asetrate=44100*{pitch_ratio},atempo={atempo}"
+        filter_chain = f"rubberband=pitch={pitch_ratio}:tempo={atempo}"
+
         command = [
             str(ffmpeg_path),
             "-y",
@@ -986,13 +1077,12 @@ class WorkerThread(QtCore.QThread):
         settings: AppSettings,
         margin_v: int,
     ) -> str:
-        alignment = {"Bottom": "2", "Center": "5", "Top": "8"}.get(settings.position, "2")
         style = (
             f"FontName={settings.font_family},"
             f"FontSize={settings.font_size},"
             f"PrimaryColour=&H{settings.text_color.lstrip('#')},"
             f"Outline={settings.border_width},"
-            f"Alignment={alignment},"
+            "Alignment=2,"
             f"MarginV={margin_v}"
         )
         safe_path = escape_ffmpeg_path(str(srt_path))
@@ -1001,7 +1091,7 @@ class WorkerThread(QtCore.QThread):
     def _build_blur_filter(self, settings: AppSettings) -> str:
         if settings.blur_mode == "Blur":
             return (
-                "boxblur=luma_radius=10:luma_power=1:"
+                "boxblur=luma_radius=25:luma_power=2:"
                 "chroma_radius=10:chroma_power=1"
             )
         color = "black"
@@ -1029,7 +1119,7 @@ class WorkerThread(QtCore.QThread):
         video_height: int,
         watermark_paths: list[tuple[Path, str]],
     ) -> list[str]:
-        margin_v = int(video_height * 0.05) if video_height > 0 else 0
+        margin_v = compute_subtitle_margin(video_height, settings.subtitle_bottom_padding)
         subtitle_enabled = settings.enable_subtitles and srt_path and srt_path.exists()
         use_complex = settings.blur_fill or settings.flip_horizontal or watermark_paths
 
@@ -1039,7 +1129,8 @@ class WorkerThread(QtCore.QThread):
             return []
 
         filter_parts = []
-        current = "[0:v]"
+        filter_parts.append("[0:v]null[vbase]")
+        current = "[vbase]"
 
         if settings.flip_horizontal:
             filter_parts.append(f"{current}hflip[vflip]")
@@ -1054,7 +1145,7 @@ class WorkerThread(QtCore.QThread):
             filter_parts.append(f"{current}crop=iw:{crop_h}:0:{crop_y}[bottom]")
             filter_parts.append(f"[bottom]{blur_filter}[blurred]")
             filter_parts.append(
-                f"{current}[blurred]overlay=0:ih*({1 - height_ratio - padding_ratio})[bg_processed]"
+                f"{current}[blurred]overlay=0:main_h*{1 - height_ratio - padding_ratio}[bg_processed]"
             )
             current = "[bg_processed]"
 
@@ -1399,8 +1490,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.border_width_spin = QtWidgets.QSpinBox()
         self.border_width_spin.setRange(0, 10)
         self.border_width_spin.setValue(2)
-        self.position_combo = QtWidgets.QComboBox()
-        self.position_combo.addItems(["Bottom", "Center", "Top"])
+        self.subtitle_padding_spin = QtWidgets.QDoubleSpinBox()
+        self.subtitle_padding_spin.setRange(0.0, 20.0)
+        self.subtitle_padding_spin.setSingleStep(0.5)
+        self.subtitle_padding_spin.setValue(5.0)
 
         subtitle_layout.addWidget(self.subtitle_enable_checkbox, 0, 0, 1, 2)
         subtitle_layout.addWidget(QtWidgets.QLabel("Font Family:"), 1, 0)
@@ -1412,8 +1505,8 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle_layout.addWidget(self.text_color_display, 4, 0, 1, 2)
         subtitle_layout.addWidget(QtWidgets.QLabel("Border Width:"), 5, 0)
         subtitle_layout.addWidget(self.border_width_spin, 5, 1)
-        subtitle_layout.addWidget(QtWidgets.QLabel("Position:"), 6, 0)
-        subtitle_layout.addWidget(self.position_combo, 6, 1)
+        subtitle_layout.addWidget(QtWidgets.QLabel("Bottom Padding (%):"), 6, 0)
+        subtitle_layout.addWidget(self.subtitle_padding_spin, 6, 1)
 
         return self.subtitle_group
 
@@ -1467,6 +1560,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_lang_combo.setCurrentText(self.config.default_whisper_language)
         if "Arial" in QtGui.QFontDatabase.families():
             self.font_family_combo.setCurrentText("Arial")
+        self.subtitle_padding_spin.setValue(5.0)
 
     def _open_settings(self):
         dialog = SettingsDialog(self.config_manager, self)
@@ -1586,9 +1680,9 @@ class MainWindow(QtWidgets.QMainWindow):
             enable_subtitles=self.subtitle_enable_checkbox.isChecked(),
             font_family=self.font_family_combo.currentText().strip(),
             font_size=self.font_size_spin.value(),
-            text_color=self.text_color_display.text().strip(),
+            text_color=rgb_hex_to_ass_bgr(self.text_color_display.text().strip()),
             border_width=self.border_width_spin.value(),
-            position=self.position_combo.currentText(),
+            subtitle_bottom_padding=self.subtitle_padding_spin.value(),
             mute_original=self.mute_radio.isChecked(),
             duck_audio=self.duck_input.value(),
             blur_fill=self.blur_checkbox.isChecked(),
@@ -1681,13 +1775,12 @@ class MainWindow(QtWidgets.QMainWindow):
         settings: AppSettings,
         margin_v: int,
     ) -> str:
-        alignment = {"Bottom": "2", "Center": "5", "Top": "8"}.get(settings.position, "2")
         style = (
             f"FontName={settings.font_family},"
             f"FontSize={settings.font_size},"
             f"PrimaryColour=&H{settings.text_color.lstrip('#')},"
             f"Outline={settings.border_width},"
-            f"Alignment={alignment},"
+            "Alignment=2,"
             f"MarginV={margin_v}"
         )
         safe_path = escape_ffmpeg_path(str(srt_path))
@@ -1696,31 +1789,53 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_preview_blur_filter(self, settings: AppSettings) -> str:
         if settings.blur_mode == "Blur":
             return (
-                "boxblur=luma_radius=10:luma_power=1:"
+                "boxblur=luma_radius=25:luma_power=2:"
                 "chroma_radius=10:chroma_power=1"
             )
         color = "black"
         return f"drawbox=y=0:h=ih:color={color}:t=fill"
 
     def _build_preview_filter_args(
-        self,
-        srt_path: Path | None,
-        settings: AppSettings,
-        video_height: int,
-        watermark_paths: list[tuple[Path, str]],
+            self,
+            srt_path: Path | None,
+            settings: AppSettings,
+            video_height: int,
+            watermark_paths: list[tuple[Path, str]],
     ) -> list[str]:
-        margin_v = int(video_height * 0.05) if video_height > 0 else 0
-        subtitle_enabled = settings.enable_subtitles and srt_path and srt_path.exists()
+        margin_v = compute_subtitle_margin(video_height, settings.subtitle_bottom_padding)
+
+        # Nếu bật phụ đề: luôn dùng SRT tạm với câu preview
+        subtitle_enabled = bool(settings.enable_subtitles)
+
+        preview_srt_path: Path | None = None
+        if subtitle_enabled:
+            tmp_dir = get_resource_path("tmp")
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            preview_srt_path = tmp_dir / "preview_subtitle.srt"
+
+            # 0s -> 10s để chụp frame nào cũng thấy phụ đề
+            preview_srt_path.write_text(
+                "1\n"
+                "00:00:00,000 --> 00:00:10,000\n"
+                "Đây là phụ đề xem trước\n",
+                encoding="utf-8",
+            )
+
         use_complex = settings.blur_fill or settings.flip_horizontal or watermark_paths
 
-        if not use_complex and subtitle_enabled:
-            return ["-vf", self._build_preview_subtitle_filter(srt_path, settings, margin_v)]
+        # Case đơn giản: không cần filter_complex
+        if not use_complex and subtitle_enabled and preview_srt_path and preview_srt_path.exists():
+            return ["-vf", self._build_preview_subtitle_filter(preview_srt_path, settings, margin_v)]
         if not use_complex and not subtitle_enabled:
             return []
 
         filter_parts = []
-        current = "[0:v]"
 
+        # luôn đặt base label rõ ràng
+        filter_parts.append("[0:v]null[vbase]")
+        current = "[vbase]"
+
+        # flip áp lên base
         if settings.flip_horizontal:
             filter_parts.append(f"{current}hflip[vflip]")
             current = "[vflip]"
@@ -1734,7 +1849,7 @@ class MainWindow(QtWidgets.QMainWindow):
             filter_parts.append(f"{current}crop=iw:{crop_h}:0:{crop_y}[bottom]")
             filter_parts.append(f"[bottom]{blur_filter}[blurred]")
             filter_parts.append(
-                f"{current}[blurred]overlay=0:ih*({1 - height_ratio - padding_ratio})[bg_processed]"
+                f"{current}[blurred]overlay=0:main_h*{1 - height_ratio - padding_ratio}[bg_processed]"
             )
             current = "[bg_processed]"
 
@@ -1744,8 +1859,8 @@ class MainWindow(QtWidgets.QMainWindow):
             filter_parts.append(f"{current}{input_label}{position}{next_label}")
             current = next_label
 
-        if subtitle_enabled:
-            subtitle_filter = self._build_preview_subtitle_filter(srt_path, settings, margin_v)
+        if subtitle_enabled and preview_srt_path and preview_srt_path.exists():
+            subtitle_filter = self._build_preview_subtitle_filter(preview_srt_path, settings, margin_v)
             filter_parts.append(f"{current}{subtitle_filter}[vout]")
         else:
             filter_parts.append(f"{current}null[vout]")
@@ -1887,7 +2002,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "font_size": self.font_size_spin.value(),
             "text_color": self.text_color_display.text(),
             "border_width": self.border_width_spin.value(),
-            "position": self.position_combo.currentText(),
+            "subtitle_bottom_padding": self.subtitle_padding_spin.value(),
             "mute_original": self.mute_radio.isChecked(),
             "duck_audio": self.duck_input.value(),
             "blur_fill": self.blur_checkbox.isChecked(),
@@ -1942,7 +2057,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.font_size_spin.setValue(int(data.get("font_size", 16)))
         self.text_color_display.setText(data.get("text_color", "#FFFFFF"))
         self.border_width_spin.setValue(int(data.get("border_width", 2)))
-        self.position_combo.setCurrentText(data.get("position", "Bottom"))
+        self.subtitle_padding_spin.setValue(float(data.get("subtitle_bottom_padding", 5.0)))
         self.mute_radio.setChecked(data.get("mute_original", True))
         self.duck_radio.setChecked(not data.get("mute_original", True))
         self.duck_input.setValue(int(data.get("duck_audio", 30)))
@@ -1981,6 +2096,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(QtGui.QIcon(str(get_resource_path("dist/icon.ico"))))
     if not find_tool("ffmpeg") or not find_tool("ffprobe"):
         progress = QtWidgets.QProgressDialog(
             "Downloading essential components (FFmpeg)...",
