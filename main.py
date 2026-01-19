@@ -63,6 +63,12 @@ def get_resource_path(relative_path: str) -> Path:
     return base_path / relative_path
 
 
+def get_video_cache_dir(video_path: Path) -> Path:
+    cache_root = get_resource_path("tmp")
+    cache_key = generate_cache_key(str(video_path.resolve()))
+    return cache_root / cache_key
+
+
 def find_tool(tool_name: str) -> Path | None:
     candidates = []
     tool_dirs = [get_resource_path("bin"), get_resource_path("tools")]
@@ -76,6 +82,12 @@ def find_tool(tool_name: str) -> Path | None:
             if tool_path.exists():
                 return tool_path
     return None
+
+
+def _get_subprocess_kwargs() -> dict:
+    if platform.system().lower().startswith("win"):
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
 
 
 def download_ffmpeg(os_name: str, log_cb=None) -> Path:
@@ -131,6 +143,7 @@ def run_subprocess(command: list[str], log_cb=None, stop_event: threading.Event 
         text=True,
         encoding="utf-8",
         errors="replace",
+        **_get_subprocess_kwargs(),
     )
     stop_watcher = None
     if stop_event is not None:
@@ -179,6 +192,7 @@ def get_audio_duration(path: Path, ffprobe_path: Path) -> float:
         encoding="utf-8",
         errors="replace",
         check=False,
+        **_get_subprocess_kwargs(),
     )
     try:
         return float(process.stdout.strip())
@@ -207,6 +221,7 @@ def get_video_duration(path: Path, ffprobe_path: Path) -> float:
         encoding="utf-8",
         errors="replace",
         check=False,
+        **_get_subprocess_kwargs(),
     )
     try:
         return float(process.stdout.strip())
@@ -235,6 +250,7 @@ def get_video_height(path: Path, ffprobe_path: Path) -> int:
         encoding="utf-8",
         errors="replace",
         check=False,
+        **_get_subprocess_kwargs(),
     )
     try:
         return int(process.stdout.strip())
@@ -343,7 +359,10 @@ class AppSettings:
     cuda: bool
     watermark_top_left: str
     watermark_top_right: str
+    watermark_height_percent: int
     flip_horizontal: bool
+    background_music_path: str
+    background_music_volume: int
     output_dir: str
 
 
@@ -376,6 +395,26 @@ class DependencyDownloadThread(QtCore.QThread):
             self.status.emit("Downloading essential components (FFmpeg)...")
             download_ffmpeg(os_key)
             self.finished.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class PreviewThread(QtCore.QThread):
+    finished = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, command: list[str], output_path: Path, parent=None):
+        super().__init__(parent)
+        self.command = command
+        self.output_path = output_path
+
+    def run(self):
+        try:
+            if run_subprocess(self.command) != 0:
+                raise RuntimeError("Failed to generate preview.")
+            if not self.output_path.exists():
+                raise RuntimeError("Preview image could not be generated.")
+            self.finished.emit(str(self.output_path))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -421,7 +460,7 @@ class WorkerThread(QtCore.QThread):
         output_dir = Path(settings.output_dir) if settings.output_dir else video_path.parent / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         self.log.emit(f"Working directory: {work_dir}")
-        cache_dir = get_resource_path("tmp")
+        cache_dir = get_video_cache_dir(video_path)
         cache_dir.mkdir(parents=True, exist_ok=True)
         ffmpeg_path = find_tool("ffmpeg")
         ffprobe_path = find_tool("ffprobe")
@@ -517,6 +556,7 @@ class WorkerThread(QtCore.QThread):
         translated_output.write_text(translated_content, encoding="utf-8")
         final_subtitle_output.write_text(translated_content, encoding="utf-8")
 
+        video_duration = None
         tts_audio = None
         if settings.enable_tts:
             self._step(60, "Generating TTS")
@@ -551,34 +591,99 @@ class WorkerThread(QtCore.QThread):
         self._check_stop()
         video_height = get_video_height(video_path, ffprobe_path)
         watermark_paths = self._collect_watermark_paths(settings)
+        background_music_path = None
+        if settings.background_music_path:
+            candidate = Path(settings.background_music_path)
+            if candidate.exists():
+                background_music_path = candidate
+            else:
+                self.log.emit(f"Background music not found: {candidate}")
         render_command = [str(ffmpeg_path), "-y", "-i", settings.video_path]
-        for watermark, _position in watermark_paths:
+        for watermark, _position, _scale in watermark_paths:
             render_command += ["-i", str(watermark)]
         if tts_audio:
             render_command += ["-i", str(tts_audio)]
+        if background_music_path:
+            render_command += ["-stream_loop", "-1", "-i", str(background_music_path)]
         video_filter_args = self._build_video_filter_args(
             final_subtitle_output,
             settings,
             video_height,
             watermark_paths,
         )
-        render_command += video_filter_args
-
-        has_video_map = "-map" in video_filter_args
         tts_input_index = 1 + len(watermark_paths)
-        if tts_audio:
-            if not has_video_map:
+        background_input_index = tts_input_index + (1 if tts_audio else 0)
+        use_audio_complex = background_music_path is not None
+        audio_filter = None
+        audio_map = None
+
+        if use_audio_complex:
+            if video_duration is None:
+                video_duration = get_video_duration(video_path, ffprobe_path)
+            base_audio_label = None
+            if tts_audio:
+                base_audio_label = f"[{tts_input_index}:a]"
+            elif not settings.mute_original:
+                base_audio_label = "[0:a]"
+
+            filter_parts = []
+            if base_audio_label:
+                if not settings.mute_original:
+                    duck_volume = max(0.1, settings.duck_audio / 100.0)
+                    filter_parts.append(f"{base_audio_label}volume={duck_volume}[abase]")
+                    base_audio_label = "[abase]"
+            bg_volume = max(0.0, min(1.0, settings.background_music_volume / 100.0))
+            filter_parts.append(
+                f"[{background_input_index}:a]volume={bg_volume},"
+                f"atrim=duration={max(video_duration or 0.1, 0.1)},"
+                "asetpts=N/SR/TB[bgm]"
+            )
+            if base_audio_label:
+                filter_parts.append(
+                    f"{base_audio_label}[bgm]amix=inputs=2:duration=first:"
+                    "dropout_transition=0:normalize=0[aout]"
+                )
+            else:
+                filter_parts.append("[bgm]anull[aout]")
+            audio_filter = ";".join(filter_parts)
+            audio_map = "[aout]"
+
+        if use_audio_complex:
+            video_filter_spec = self._build_video_filter_spec(
+                final_subtitle_output,
+                settings,
+                video_height,
+                watermark_paths,
+            )
+            filter_parts = []
+            if video_filter_spec["type"] == "complex":
+                filter_parts.append(video_filter_spec["filter"])
+            filter_parts.append(audio_filter)
+            render_command += ["-filter_complex", ";".join(filter_parts)]
+            if video_filter_spec["type"] == "complex":
+                render_command += ["-map", video_filter_spec["map"]]
+            else:
+                if video_filter_spec["type"] == "simple":
+                    render_command += ["-vf", video_filter_spec["filter"]]
                 render_command += ["-map", "0:v"]
-            render_command += ["-map", f"{tts_input_index}:a"]
-        else:
-            if not has_video_map:
-                render_command += ["-map", "0:v"]
-            render_command += ["-map", "0:a?"]
-        if settings.mute_original:
+            render_command += ["-map", audio_map]
             render_command += ["-c:a", "aac", "-b:a", "192k"]
         else:
-            duck_volume = max(0.1, settings.duck_audio / 100.0)
-            render_command += ["-filter:a", f"volume={duck_volume}"]
+            render_command += video_filter_args
+            has_video_map = "-map" in video_filter_args
+            if tts_audio:
+                if not has_video_map:
+                    render_command += ["-map", "0:v"]
+                render_command += ["-map", f"{tts_input_index}:a"]
+            else:
+                if not has_video_map:
+                    render_command += ["-map", "0:v"]
+                render_command += ["-map", "0:a?"]
+            if settings.mute_original:
+                render_command += ["-c:a", "aac", "-b:a", "192k"]
+            else:
+                duck_volume = max(0.1, settings.duck_audio / 100.0)
+                render_command += ["-filter:a", f"volume={duck_volume}"]
 
         output_path = output_dir / f"final_{video_stem}.mp4"
         render_command.append(str(output_path))
@@ -1097,8 +1202,9 @@ class WorkerThread(QtCore.QThread):
         color = "black"
         return f"drawbox=y=0:h=ih:color={color}:t=fill"
 
-    def _collect_watermark_paths(self, settings: AppSettings) -> list[tuple[Path, str]]:
+    def _collect_watermark_paths(self, settings: AppSettings) -> list[tuple[Path, str, float]]:
         paths = []
+        scale_factor = max(1, settings.watermark_height_percent) / 100.0
         for label, raw_path, position in (
             ("Top-Left", settings.watermark_top_left, "overlay=10:10"),
             ("Top-Right", settings.watermark_top_right, "overlay=main_w-overlay_w-10:10"),
@@ -1109,24 +1215,24 @@ class WorkerThread(QtCore.QThread):
             if not path.exists():
                 self.log.emit(f"Watermark {label} not found: {path}")
                 continue
-            paths.append((path, position))
+            paths.append((path, position, scale_factor))
         return paths
 
-    def _build_video_filter_args(
+    def _build_video_filter_spec(
         self,
         srt_path: Path | None,
         settings: AppSettings,
         video_height: int,
-        watermark_paths: list[tuple[Path, str]],
-    ) -> list[str]:
+        watermark_paths: list[tuple[Path, str, float]],
+    ) -> dict:
         margin_v = compute_subtitle_margin(video_height, settings.subtitle_bottom_padding)
         subtitle_enabled = settings.enable_subtitles and srt_path and srt_path.exists()
         use_complex = settings.blur_fill or settings.flip_horizontal or watermark_paths
 
         if not use_complex and subtitle_enabled:
-            return ["-vf", self._build_subtitle_filter(srt_path, settings, margin_v)]
+            return {"type": "simple", "filter": self._build_subtitle_filter(srt_path, settings, margin_v)}
         if not use_complex and not subtitle_enabled:
-            return []
+            return {"type": "none"}
 
         filter_parts = []
         filter_parts.append("[0:v]null[vbase]")
@@ -1149,10 +1255,14 @@ class WorkerThread(QtCore.QThread):
             )
             current = "[bg_processed]"
 
-        for idx, (_watermark_path, position) in enumerate(watermark_paths):
+        for idx, (_watermark_path, position, scale_factor) in enumerate(watermark_paths):
             input_label = f"[{idx + 1}:v]"
+            scaled_label = f"[wms{idx}]"
             next_label = f"[wm{idx}]"
-            filter_parts.append(f"{current}{input_label}{position}{next_label}")
+            filter_parts.append(
+                f"{input_label}scale=iw*{scale_factor:.4f}:ih*{scale_factor:.4f}{scaled_label}"
+            )
+            filter_parts.append(f"{current}{scaled_label}{position}{next_label}")
             current = next_label
 
         if subtitle_enabled:
@@ -1162,7 +1272,21 @@ class WorkerThread(QtCore.QThread):
             filter_parts.append(f"{current}null[vout]")
 
         filter_complex = ";".join(filter_parts)
-        return ["-filter_complex", filter_complex, "-map", "[vout]"]
+        return {"type": "complex", "filter": filter_complex, "map": "[vout]"}
+
+    def _build_video_filter_args(
+        self,
+        srt_path: Path | None,
+        settings: AppSettings,
+        video_height: int,
+        watermark_paths: list[tuple[Path, str, float]],
+    ) -> list[str]:
+        spec = self._build_video_filter_spec(srt_path, settings, video_height, watermark_paths)
+        if spec["type"] == "none":
+            return []
+        if spec["type"] == "simple":
+            return ["-vf", spec["filter"]]
+        return ["-filter_complex", spec["filter"], "-map", spec["map"]]
 
 
 class SettingsDialog(QtWidgets.QDialog):
@@ -1241,6 +1365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config = config_manager.config
         self.worker = None
         self.model_fetch_thread = None
+        self.preview_thread = None
         self._session_state = None
         self._user_stop_requested = False
 
@@ -1292,6 +1417,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(self.left_column_group)
         layout.addWidget(self._build_video_source_group())
         layout.addWidget(self._build_asr_trans_group())
+        layout.addWidget(self._build_watermark_group())
         layout.addStretch()
         return self.left_column_group
 
@@ -1374,7 +1500,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.asr_trans_group
 
     def _build_dubbing_watermark_group(self):
-        self.dubbing_group = QtWidgets.QGroupBox("Dubbing / Watermark Settings")
+        self.dubbing_group = QtWidgets.QGroupBox("Dubbing / Post-Processing Settings")
         layout = QtWidgets.QVBoxLayout(self.dubbing_group)
 
         tts_group = QtWidgets.QGroupBox("Dubbing (TTS)")
@@ -1407,28 +1533,6 @@ class MainWindow(QtWidgets.QMainWindow):
         tts_layout.addWidget(QtWidgets.QLabel("Pitch:"), 4, 0)
         tts_layout.addWidget(self.pitch_input, 4, 1)
 
-        watermark_group = QtWidgets.QGroupBox("Watermarks & Effects")
-        watermark_layout = QtWidgets.QGridLayout(watermark_group)
-        self.watermark_top_left_edit = QtWidgets.QLineEdit()
-        self.watermark_top_left_button = QtWidgets.QPushButton("Browse")
-        self.watermark_top_left_button.clicked.connect(
-            lambda: self._browse_watermark(self.watermark_top_left_edit)
-        )
-        self.watermark_top_right_edit = QtWidgets.QLineEdit()
-        self.watermark_top_right_button = QtWidgets.QPushButton("Browse")
-        self.watermark_top_right_button.clicked.connect(
-            lambda: self._browse_watermark(self.watermark_top_right_edit)
-        )
-        self.flip_checkbox = QtWidgets.QCheckBox("Flip Video Horizontally")
-
-        watermark_layout.addWidget(QtWidgets.QLabel("Watermark Top-Left"), 0, 0)
-        watermark_layout.addWidget(self.watermark_top_left_edit, 0, 1)
-        watermark_layout.addWidget(self.watermark_top_left_button, 0, 2)
-        watermark_layout.addWidget(QtWidgets.QLabel("Watermark Top-Right"), 1, 0)
-        watermark_layout.addWidget(self.watermark_top_right_edit, 1, 1)
-        watermark_layout.addWidget(self.watermark_top_right_button, 1, 2)
-        watermark_layout.addWidget(self.flip_checkbox, 2, 0, 1, 3)
-
         post_group = QtWidgets.QGroupBox("Post-Processing")
         post_layout = QtWidgets.QGridLayout(post_group)
         self.mute_radio = QtWidgets.QRadioButton("Mute Original")
@@ -1437,6 +1541,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.duck_input = QtWidgets.QSpinBox()
         self.duck_input.setRange(0, 100)
         self.duck_input.setValue(30)
+        self.background_music_edit = QtWidgets.QLineEdit()
+        self.background_music_button = QtWidgets.QPushButton("Browse")
+        self.background_music_button.clicked.connect(self._browse_background_music)
+        self.background_music_volume_spin = QtWidgets.QSpinBox()
+        self.background_music_volume_spin.setRange(0, 100)
+        self.background_music_volume_spin.setValue(30)
         self.blur_checkbox = QtWidgets.QCheckBox("Blur/Fill Bottom")
         self.blur_checkbox.setChecked(True)
         self.blur_height_spin = QtWidgets.QSpinBox()
@@ -1454,18 +1564,51 @@ class MainWindow(QtWidgets.QMainWindow):
         post_layout.addWidget(self.duck_radio, 0, 1)
         post_layout.addWidget(QtWidgets.QLabel("Duck Volume:"), 1, 0)
         post_layout.addWidget(self.duck_input, 1, 1)
-        post_layout.addWidget(self.blur_checkbox, 2, 0, 1, 2)
-        post_layout.addWidget(QtWidgets.QLabel("Height %:"), 3, 0)
-        post_layout.addWidget(self.blur_height_spin, 3, 1)
-        post_layout.addWidget(QtWidgets.QLabel("Blur Bottom Padding (%):"), 4, 0)
-        post_layout.addWidget(self.blur_padding_spin, 4, 1)
-        post_layout.addWidget(self.blur_mode_combo, 5, 0, 1, 2)
-        post_layout.addWidget(self.cuda_checkbox, 6, 0, 1, 2)
+        post_layout.addWidget(QtWidgets.QLabel("Background Music:"), 2, 0)
+        post_layout.addWidget(self.background_music_edit, 2, 1)
+        post_layout.addWidget(self.background_music_button, 2, 2)
+        post_layout.addWidget(QtWidgets.QLabel("BG Music Volume (%):"), 3, 0)
+        post_layout.addWidget(self.background_music_volume_spin, 3, 1)
+        post_layout.addWidget(self.blur_checkbox, 4, 0, 1, 2)
+        post_layout.addWidget(QtWidgets.QLabel("Height %:"), 5, 0)
+        post_layout.addWidget(self.blur_height_spin, 5, 1)
+        post_layout.addWidget(QtWidgets.QLabel("Blur Bottom Padding (%):"), 6, 0)
+        post_layout.addWidget(self.blur_padding_spin, 6, 1)
+        post_layout.addWidget(self.blur_mode_combo, 7, 0, 1, 2)
+        post_layout.addWidget(self.cuda_checkbox, 8, 0, 1, 2)
 
         layout.addWidget(tts_group)
-        layout.addWidget(watermark_group)
         layout.addWidget(post_group)
         return self.dubbing_group
+
+    def _build_watermark_group(self):
+        self.watermark_group = QtWidgets.QGroupBox("Watermarks & Effects")
+        watermark_layout = QtWidgets.QGridLayout(self.watermark_group)
+        self.watermark_top_left_edit = QtWidgets.QLineEdit()
+        self.watermark_top_left_button = QtWidgets.QPushButton("Browse")
+        self.watermark_top_left_button.clicked.connect(
+            lambda: self._browse_watermark(self.watermark_top_left_edit)
+        )
+        self.watermark_top_right_edit = QtWidgets.QLineEdit()
+        self.watermark_top_right_button = QtWidgets.QPushButton("Browse")
+        self.watermark_top_right_button.clicked.connect(
+            lambda: self._browse_watermark(self.watermark_top_right_edit)
+        )
+        self.watermark_height_spin = QtWidgets.QSpinBox()
+        self.watermark_height_spin.setRange(10, 300)
+        self.watermark_height_spin.setValue(100)
+        self.flip_checkbox = QtWidgets.QCheckBox("Flip Video Horizontally")
+
+        watermark_layout.addWidget(QtWidgets.QLabel("Watermark Top-Left"), 0, 0)
+        watermark_layout.addWidget(self.watermark_top_left_edit, 0, 1)
+        watermark_layout.addWidget(self.watermark_top_left_button, 0, 2)
+        watermark_layout.addWidget(QtWidgets.QLabel("Watermark Top-Right"), 1, 0)
+        watermark_layout.addWidget(self.watermark_top_right_edit, 1, 1)
+        watermark_layout.addWidget(self.watermark_top_right_button, 1, 2)
+        watermark_layout.addWidget(QtWidgets.QLabel("Watermark Height (%):"), 2, 0)
+        watermark_layout.addWidget(self.watermark_height_spin, 2, 1)
+        watermark_layout.addWidget(self.flip_checkbox, 3, 0, 1, 3)
+        return self.watermark_group
 
     def _build_center_column(self):
         self.center_column_group = QtWidgets.QGroupBox("Column 2: Visuals & Audio")
@@ -1639,6 +1782,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             target_edit.setText(path)
 
+    def _browse_background_music(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Background Music",
+            "",
+            "Audio Files (*.mp3 *.wav *.aac *.flac *.ogg *.m4a)",
+        )
+        if path:
+            self.background_music_edit.setText(path)
+
     def _select_color(self):
         color = QtWidgets.QColorDialog.getColor()
         if color.isValid():
@@ -1692,12 +1845,16 @@ class MainWindow(QtWidgets.QMainWindow):
             cuda=self.cuda_checkbox.isChecked(),
             watermark_top_left=self.watermark_top_left_edit.text().strip(),
             watermark_top_right=self.watermark_top_right_edit.text().strip(),
+            watermark_height_percent=self.watermark_height_spin.value(),
             flip_horizontal=self.flip_checkbox.isChecked(),
+            background_music_path=self.background_music_edit.text().strip(),
+            background_music_volume=self.background_music_volume_spin.value(),
             output_dir=output_dir,
         )
 
-    def _collect_watermark_paths(self) -> list[tuple[Path, str]]:
+    def _collect_watermark_paths(self) -> list[tuple[Path, str, float]]:
         paths = []
+        scale_factor = max(1, self.watermark_height_spin.value()) / 100.0
         for label, raw_path, position in (
             ("Top-Left", self.watermark_top_left_edit.text().strip(), "overlay=10:10"),
             (
@@ -1712,10 +1869,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if not path.exists():
                 self.log_console.append(f"Watermark {label} not found: {path}")
                 continue
-            paths.append((path, position))
+            paths.append((path, position, scale_factor))
         return paths
 
     def _generate_preview(self):
+        if self.preview_thread and self.preview_thread.isRunning():
+            return
         settings = self._build_settings()
         if not settings.video_path:
             QtWidgets.QMessageBox.warning(self, "Missing Video", "Please select a video file.")
@@ -1734,12 +1893,12 @@ class MainWindow(QtWidgets.QMainWindow):
         seek_time = max(0.0, duration / 2.0)
         watermark_paths = self._collect_watermark_paths()
 
-        preview_dir = get_resource_path("tmp")
+        preview_dir = get_video_cache_dir(video_path)
         preview_dir.mkdir(parents=True, exist_ok=True)
         preview_path = preview_dir / "preview_frame.jpg"
 
         command = [str(ffmpeg_path), "-y", "-ss", f"{seek_time:.2f}", "-i", str(video_path)]
-        for watermark, _position in watermark_paths:
+        for watermark, _position, _scale in watermark_paths:
             command += ["-i", str(watermark)]
         command += ["-vframes", "1"]
 
@@ -1754,12 +1913,17 @@ class MainWindow(QtWidgets.QMainWindow):
         command += filter_args
         command.append(str(preview_path))
 
-        if run_subprocess(command, self.log_console.append) != 0:
-            QtWidgets.QMessageBox.critical(self, "Preview Error", "Failed to generate preview.")
-            return
+        self.preview_button.setEnabled(False)
+        self.preview_label.setText("Generating preview...")
+        self.preview_thread = PreviewThread(command, preview_path, self)
+        self.preview_thread.finished.connect(self._handle_preview_finished)
+        self.preview_thread.failed.connect(self._handle_preview_failed)
+        self.preview_thread.start()
+
+    def _handle_preview_finished(self, preview_path: str):
         pixmap = QtGui.QPixmap(str(preview_path))
         if pixmap.isNull():
-            QtWidgets.QMessageBox.warning(self, "Preview Error", "Preview image could not be loaded.")
+            self._handle_preview_failed("Preview image could not be loaded.")
             return
         scaled = pixmap.scaled(
             self.preview_label.width(),
@@ -1768,6 +1932,14 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.Qt.TransformationMode.SmoothTransformation,
         )
         self.preview_label.setPixmap(scaled)
+        self.preview_button.setEnabled(True)
+        self.preview_thread = None
+
+    def _handle_preview_failed(self, error: str):
+        self.preview_button.setEnabled(True)
+        self.preview_label.setText("Preview will appear here.")
+        self.preview_thread = None
+        QtWidgets.QMessageBox.critical(self, "Preview Error", error)
 
     def _build_preview_subtitle_filter(
         self,
@@ -1796,11 +1968,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return f"drawbox=y=0:h=ih:color={color}:t=fill"
 
     def _build_preview_filter_args(
-            self,
-            srt_path: Path | None,
-            settings: AppSettings,
-            video_height: int,
-            watermark_paths: list[tuple[Path, str]],
+        self,
+        srt_path: Path | None,
+        settings: AppSettings,
+        video_height: int,
+        watermark_paths: list[tuple[Path, str, float]],
     ) -> list[str]:
         margin_v = compute_subtitle_margin(video_height, settings.subtitle_bottom_padding)
 
@@ -1809,7 +1981,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         preview_srt_path: Path | None = None
         if subtitle_enabled:
-            tmp_dir = get_resource_path("tmp")
+            tmp_dir = get_video_cache_dir(Path(settings.video_path))
             tmp_dir.mkdir(parents=True, exist_ok=True)
             preview_srt_path = tmp_dir / "preview_subtitle.srt"
 
@@ -1853,10 +2025,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             current = "[bg_processed]"
 
-        for idx, (_watermark_path, position) in enumerate(watermark_paths):
+        for idx, (_watermark_path, position, scale_factor) in enumerate(watermark_paths):
             input_label = f"[{idx + 1}:v]"
+            scaled_label = f"[wms{idx}]"
             next_label = f"[wm{idx}]"
-            filter_parts.append(f"{current}{input_label}{position}{next_label}")
+            filter_parts.append(
+                f"{input_label}scale=iw*{scale_factor:.4f}:ih*{scale_factor:.4f}{scaled_label}"
+            )
+            filter_parts.append(f"{current}{scaled_label}{position}{next_label}")
             current = next_label
 
         if subtitle_enabled and preview_srt_path and preview_srt_path.exists():
@@ -1946,6 +2122,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for group in (
             self.video_source_group,
             self.asr_trans_group,
+            self.watermark_group,
             self.dubbing_group,
             self.subtitle_group,
             self.preview_group,
@@ -2012,7 +2189,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "cuda": self.cuda_checkbox.isChecked(),
             "watermark_top_left": self.watermark_top_left_edit.text(),
             "watermark_top_right": self.watermark_top_right_edit.text(),
+            "watermark_height_percent": self.watermark_height_spin.value(),
             "flip_horizontal": self.flip_checkbox.isChecked(),
+            "background_music_path": self.background_music_edit.text(),
+            "background_music_volume": self.background_music_volume_spin.value(),
             "last_opened_directory": self.config.last_opened_directory,
             "config": {
                 "openai_api_key": self.config.openai_api_key,
@@ -2068,7 +2248,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cuda_checkbox.setChecked(data.get("cuda", False))
         self.watermark_top_left_edit.setText(data.get("watermark_top_left", ""))
         self.watermark_top_right_edit.setText(data.get("watermark_top_right", ""))
+        self.watermark_height_spin.setValue(int(data.get("watermark_height_percent", 100)))
         self.flip_checkbox.setChecked(data.get("flip_horizontal", False))
+        self.background_music_edit.setText(data.get("background_music_path", ""))
+        self.background_music_volume_spin.setValue(int(data.get("background_music_volume", 30)))
         self.config.last_opened_directory = data.get("last_opened_directory", "")
         config_data = data.get("config", {})
         self.config.openai_api_key = config_data.get("openai_api_key", self.config.openai_api_key)
