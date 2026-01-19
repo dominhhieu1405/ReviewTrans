@@ -32,7 +32,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     name="VideoTranslationStudio",
-    icon=str(app_dir / 'dist' / 'icon.ico'),
+    icon=str(app_dir / 'icon.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -2096,7 +2096,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setWindowIcon(QtGui.QIcon(str(get_resource_path("dist/icon.ico"))))
+    app.setWindowIcon(QtGui.QIcon(str(get_resource_path("icon.ico"))))
     if not find_tool("ffmpeg") or not find_tool("ffprobe"):
         progress = QtWidgets.QProgressDialog(
             "Downloading essential components (FFmpeg)...",
