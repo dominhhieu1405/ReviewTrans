@@ -9,6 +9,7 @@ from pathlib import Path
 class AppConfig:
     openai_api_key: str = ""
     gemini_api_key: str = ""
+    gemini_api_keys: list[str] = field(default_factory=list)
     custom_tts_key: str = ""
     custom_tts_url: str = ""
     vbee_app_id: str = ""
@@ -46,6 +47,7 @@ class ConfigManager:
         self.config = AppConfig(
             openai_api_key=data.get("openai_api_key", ""),
             gemini_api_key=data.get("gemini_api_key", ""),
+            gemini_api_keys=self._load_gemini_keys(data),
             custom_tts_key=data.get("custom_tts_key", ""),
             custom_tts_url=data.get("custom_tts_url", ""),
             vbee_app_id=data.get("vbee_app_id", ""),
@@ -64,10 +66,19 @@ class ConfigManager:
         )
         return self.config
 
+    @staticmethod
+    def _load_gemini_keys(data: dict) -> list[str]:
+        raw_keys = data.get("gemini_api_keys")
+        if isinstance(raw_keys, list):
+            return [str(key).strip() for key in raw_keys if str(key).strip()]
+        legacy_key = str(data.get("gemini_api_key", "")).strip()
+        return [legacy_key] if legacy_key else []
+
     def save(self) -> None:
         data = {
             "openai_api_key": self.config.openai_api_key,
             "gemini_api_key": self.config.gemini_api_key,
+            "gemini_api_keys": self.config.gemini_api_keys,
             "custom_tts_key": self.config.custom_tts_key,
             "custom_tts_url": self.config.custom_tts_url,
             "vbee_app_id": self.config.vbee_app_id,

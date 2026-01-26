@@ -436,6 +436,7 @@ class WorkerThread(QtCore.QThread):
         self.settings = settings
         self.config = config
         self._stop_event = threading.Event()
+        self._gemini_key_index = 0
 
     def stop(self):
         self._stop_event.set()
@@ -786,13 +787,24 @@ class WorkerThread(QtCore.QThread):
             )
             return response.choices[0].message.content.strip()
         if settings.provider == "Gemini":
-            client = genai.Client(api_key=self.config.gemini_api_key)
+            api_key = self._next_gemini_key()
+            client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
                 model=settings.provider_model,
                 contents=f"{system_instructions}\n\n{prompt}",
             )
             return response.text.strip()
         return text
+
+    def _next_gemini_key(self) -> str:
+        keys = [key for key in self.config.gemini_api_keys if key.strip()]
+        if not keys:
+            if not self.config.gemini_api_key:
+                raise RuntimeError("Gemini API key is required.")
+            return self.config.gemini_api_key
+        key = keys[self._gemini_key_index % len(keys)]
+        self._gemini_key_index += 1
+        return key
 
     def _generate_tts(
         self,
@@ -1306,10 +1318,14 @@ class SettingsDialog(QtWidgets.QDialog):
         self.openai_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.gemini_key_edit = QtWidgets.QLineEdit(self.config.gemini_api_key)
         self.gemini_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.gemini_keys_edit = QtWidgets.QPlainTextEdit()
+        self.gemini_keys_edit.setPlaceholderText("One key per line")
+        self.gemini_keys_edit.setPlainText("\n".join(self.config.gemini_api_keys))
         self.custom_tts_key_edit = QtWidgets.QLineEdit(self.config.custom_tts_key)
         self.custom_tts_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         general_layout.addRow("OpenAI API Key:", self.openai_key_edit)
         general_layout.addRow("Gemini API Key:", self.gemini_key_edit)
+        general_layout.addRow("Gemini API Keys (round-robin):", self.gemini_keys_edit)
         general_layout.addRow("Custom TTS Key:", self.custom_tts_key_edit)
 
         tts_tab = QtWidgets.QWidget()
@@ -1346,6 +1362,11 @@ class SettingsDialog(QtWidgets.QDialog):
     def _save(self):
         self.config.openai_api_key = self.openai_key_edit.text().strip()
         self.config.gemini_api_key = self.gemini_key_edit.text().strip()
+        self.config.gemini_api_keys = [
+            key.strip()
+            for key in self.gemini_keys_edit.toPlainText().splitlines()
+            if key.strip()
+        ]
         self.config.custom_tts_key = self.custom_tts_key_edit.text().strip()
         self.config.custom_tts_url = self.custom_tts_url_edit.text().strip()
         self.config.vbee_app_id = self.vbee_app_id_edit.text().strip()
@@ -2197,6 +2218,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "config": {
                 "openai_api_key": self.config.openai_api_key,
                 "gemini_api_key": self.config.gemini_api_key,
+                "gemini_api_keys": self.config.gemini_api_keys,
                 "custom_tts_key": self.config.custom_tts_key,
                 "custom_tts_url": self.config.custom_tts_url,
                 "vbee_app_id": self.config.vbee_app_id,
@@ -2256,6 +2278,10 @@ class MainWindow(QtWidgets.QMainWindow):
         config_data = data.get("config", {})
         self.config.openai_api_key = config_data.get("openai_api_key", self.config.openai_api_key)
         self.config.gemini_api_key = config_data.get("gemini_api_key", self.config.gemini_api_key)
+        self.config.gemini_api_keys = config_data.get(
+            "gemini_api_keys",
+            self.config.gemini_api_keys,
+        )
         self.config.custom_tts_key = config_data.get("custom_tts_key", self.config.custom_tts_key)
         self.config.custom_tts_url = config_data.get("custom_tts_url", self.config.custom_tts_url)
         self.config.vbee_app_id = config_data.get("vbee_app_id", self.config.vbee_app_id)
