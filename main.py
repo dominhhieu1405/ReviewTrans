@@ -1412,6 +1412,12 @@ class MergeWorkerThread(QtCore.QThread):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
+
+    def _build_concat_file_line(self, path: Path) -> str:
+        normalized = str(path).replace("\\", "/")
+        escaped = normalized.replace("'", "'\\''")
+        return f"file '{escaped}'"
+
     def _run_merge(self):
         if len(self.video_paths) < 2:
             raise ValueError("Please select at least 2 videos to merge.")
@@ -1435,7 +1441,7 @@ class MergeWorkerThread(QtCore.QThread):
 
         work_dir = Path(tempfile.mkdtemp(prefix="video_merge_"))
         concat_file = work_dir / "concat_list.txt"
-        concat_lines = [f"file '{escape_ffmpeg_path(str(path))}'" for path in resolved_paths]
+        concat_lines = [self._build_concat_file_line(path) for path in resolved_paths]
         concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
 
         self.status.emit("Merging videos")
