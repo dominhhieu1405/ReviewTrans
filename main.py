@@ -320,6 +320,14 @@ def parse_timestamp(timestamp: str) -> float:
     return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
 
 
+def parse_ffmpeg_progress_time(raw_time: str) -> float:
+    try:
+        hours, minutes, seconds = raw_time.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def render_srt(entries: list[dict]) -> str:
     blocks = []
     for entry in entries:
@@ -1377,6 +1385,133 @@ class SettingsDialog(QtWidgets.QDialog):
         self.accept()
 
 
+
+
+class MergeWorkerThread(QtCore.QThread):
+    progress = QtCore.pyqtSignal(int)
+    status = QtCore.pyqtSignal(str)
+    log = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+    stopped = QtCore.pyqtSignal()
+
+    def __init__(self, video_paths: list[str], output_path: str, parent=None):
+        super().__init__(parent)
+        self.video_paths = video_paths
+        self.output_path = output_path
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        try:
+            self._run_merge()
+        except StopProcessing:
+            self.stopped.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+    def _build_concat_file_line(self, path: Path) -> str:
+        normalized = str(path).replace("\\", "/")
+        escaped = normalized.replace("'", "'\\''")
+        return f"file '{escaped}'"
+
+    def _run_merge(self):
+        if len(self.video_paths) < 2:
+            raise ValueError("Please select at least 2 videos to merge.")
+
+        ffmpeg_path = find_tool("ffmpeg")
+        ffprobe_path = find_tool("ffprobe")
+        if not ffmpeg_path or not ffprobe_path:
+            raise FileNotFoundError("ffmpeg/ffprobe not found in bin/ or tools/ folder.")
+
+        total_duration = 0.0
+        resolved_paths: list[Path] = []
+        for raw_path in self.video_paths:
+            path = Path(raw_path)
+            if not path.exists():
+                raise FileNotFoundError(f"Video not found: {path}")
+            resolved_paths.append(path)
+            total_duration += get_video_duration(path, ffprobe_path)
+
+        output_path = Path(self.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        work_dir = Path(tempfile.mkdtemp(prefix="video_merge_"))
+        concat_file = work_dir / "concat_list.txt"
+        concat_lines = [self._build_concat_file_line(path) for path in resolved_paths]
+        concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+        self.status.emit("Merging videos")
+        self.progress.emit(0)
+        command = [
+            str(ffmpeg_path),
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file),
+            "-c",
+            "copy",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            str(output_path),
+        ]
+        self.log.emit(f"Running: {' '.join(command)}")
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_get_subprocess_kwargs(),
+        )
+
+        stop_watcher = threading.Thread(
+            target=_terminate_on_stop,
+            args=(process, self._stop_event),
+            daemon=True,
+        )
+        stop_watcher.start()
+
+        if process.stdout:
+            for line in process.stdout:
+                cleaned = line.rstrip()
+                self.log.emit(cleaned)
+                if cleaned.startswith("out_time=") and total_duration > 0:
+                    progress_time = parse_ffmpeg_progress_time(cleaned.split("=", 1)[1].strip())
+                    percent = min(99, int((progress_time / total_duration) * 100))
+                    self.progress.emit(max(0, percent))
+
+        return_code = process.wait()
+        if self._stop_event.is_set():
+            raise StopProcessing
+        if return_code != 0:
+            raise RuntimeError("Video merge failed.")
+        self.progress.emit(100)
+        self.status.emit("Done")
+        self.finished.emit(str(output_path))
+
+
+class DraggableVideoListWidget(QtWidgets.QListWidget):
+    orderChanged = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        super().dropEvent(event)
+        self.orderChanged.emit()
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, config_manager: ConfigManager):
         super().__init__()
@@ -1393,16 +1528,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_menu()
         self._apply_theme()
 
+        self.merge_worker = None
+        self._merge_elapsed_seconds = 0
+
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        main_layout = QtWidgets.QHBoxLayout(central)
+        main_layout = QtWidgets.QVBoxLayout(central)
 
-        column_layout = QtWidgets.QHBoxLayout()
-        main_layout.addLayout(column_layout)
-
-        column_layout.addWidget(self._build_left_column())
-        column_layout.addWidget(self._build_center_column())
-        column_layout.addWidget(self._build_right_column())
+        self.main_tabs = QtWidgets.QTabWidget()
+        self.main_tabs.addTab(self._build_translate_tab(), "Translate / Dub")
+        self.main_tabs.addTab(self._build_merge_tab(), "Merge Video")
+        main_layout.addWidget(self.main_tabs)
 
         self._update_source_mode()
         self._update_provider_models()
@@ -1410,6 +1546,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_session_state()
         self._fetch_models_async()
         self._init_timer()
+        self._init_merge_timer()
 
     def _build_menu(self):
         menu = self.menuBar().addMenu("Settings")
@@ -1432,6 +1569,77 @@ class MainWindow(QtWidgets.QMainWindow):
         palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#0078d4"))
         palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
         self.setPalette(palette)
+
+    def _build_translate_tab(self):
+        tab = QtWidgets.QWidget()
+        main_layout = QtWidgets.QHBoxLayout(tab)
+        column_layout = QtWidgets.QHBoxLayout()
+        main_layout.addLayout(column_layout)
+
+        column_layout.addWidget(self._build_left_column())
+        column_layout.addWidget(self._build_center_column())
+        column_layout.addWidget(self._build_right_column())
+        return tab
+
+    def _build_merge_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        merge_source_group = QtWidgets.QGroupBox("Merge Sources")
+        source_layout = QtWidgets.QVBoxLayout(merge_source_group)
+
+        button_row = QtWidgets.QHBoxLayout()
+        self.merge_add_button = QtWidgets.QPushButton("Add Videos")
+        self.merge_add_button.clicked.connect(self._merge_add_videos)
+        self.merge_remove_button = QtWidgets.QPushButton("Remove Selected")
+        self.merge_remove_button.clicked.connect(self._merge_remove_selected)
+        self.merge_clear_button = QtWidgets.QPushButton("Clear List")
+        self.merge_clear_button.clicked.connect(self._merge_clear_list)
+        button_row.addWidget(self.merge_add_button)
+        button_row.addWidget(self.merge_remove_button)
+        button_row.addWidget(self.merge_clear_button)
+        button_row.addStretch()
+
+        self.merge_list = DraggableVideoListWidget()
+        self.merge_list.orderChanged.connect(self._merge_on_order_changed)
+
+        helper_label = QtWidgets.QLabel("Drag & drop to change video order.")
+        helper_label.setStyleSheet("color: #a9a9a9;")
+
+        source_layout.addLayout(button_row)
+        source_layout.addWidget(helper_label)
+        source_layout.addWidget(self.merge_list)
+
+        merge_output_group = QtWidgets.QGroupBox("Merge Output")
+        output_layout = QtWidgets.QGridLayout(merge_output_group)
+        self.merge_output_edit = QtWidgets.QLineEdit()
+        self.merge_output_button = QtWidgets.QPushButton("Select Output")
+        self.merge_output_button.clicked.connect(self._merge_select_output)
+        self.merge_start_button = QtWidgets.QPushButton("Start Merge")
+        self.merge_start_button.clicked.connect(self._toggle_merge_processing)
+        self._merge_start_button_default_style = self.merge_start_button.styleSheet()
+        self.merge_progress_bar = QtWidgets.QProgressBar()
+        self.merge_status_label = QtWidgets.QLabel("Idle")
+        self.merge_time_label = QtWidgets.QLabel("Processing Time: 00:00")
+
+        output_layout.addWidget(QtWidgets.QLabel("Output File"), 0, 0)
+        output_layout.addWidget(self.merge_output_edit, 0, 1)
+        output_layout.addWidget(self.merge_output_button, 0, 2)
+        output_layout.addWidget(self.merge_start_button, 1, 0, 1, 3)
+        output_layout.addWidget(self.merge_progress_bar, 2, 0, 1, 3)
+        output_layout.addWidget(self.merge_status_label, 3, 0, 1, 3)
+        output_layout.addWidget(self.merge_time_label, 4, 0, 1, 3)
+
+        merge_log_group = QtWidgets.QGroupBox("Merge Log")
+        log_layout = QtWidgets.QVBoxLayout(merge_log_group)
+        self.merge_log_console = QtWidgets.QTextEdit()
+        self.merge_log_console.setReadOnly(True)
+        log_layout.addWidget(self.merge_log_console)
+
+        layout.addWidget(merge_source_group)
+        layout.addWidget(merge_output_group)
+        layout.addWidget(merge_log_group)
+        return tab
 
     def _build_left_column(self):
         self.left_column_group = QtWidgets.QGroupBox("Column 1: Source & Translation")
@@ -1783,6 +1991,62 @@ class MainWindow(QtWidgets.QMainWindow):
             self.config.last_opened_directory = str(Path(path).parent)
             self.config_manager.save()
 
+    def _merge_add_videos(self):
+        start_dir = self.config.last_opened_directory or ""
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Select Videos to Merge",
+            start_dir,
+            f"Video Files ({SUPPORTED_VIDEO_EXTENSIONS})",
+        )
+        if not paths:
+            return
+
+        for path in paths:
+            item = QtWidgets.QListWidgetItem(path)
+            item.setToolTip(path)
+            self.merge_list.addItem(item)
+
+        self.config.last_opened_directory = str(Path(paths[0]).parent)
+        self.config_manager.save()
+
+        if not self.merge_output_edit.text().strip() and self.merge_list.count() > 0:
+            first_video = Path(self.merge_list.item(0).text())
+            default_output = first_video.parent / "output" / f"{first_video.stem}_merged.mp4"
+            self.merge_output_edit.setText(str(default_output))
+
+    def _merge_remove_selected(self):
+        for item in self.merge_list.selectedItems():
+            row = self.merge_list.row(item)
+            self.merge_list.takeItem(row)
+
+    def _merge_clear_list(self):
+        self.merge_list.clear()
+
+    def _merge_on_order_changed(self):
+        self.merge_log_console.append("Video order updated.")
+
+    def _merge_select_output(self):
+        default_path = self.merge_output_edit.text().strip()
+        if not default_path and self.merge_list.count() > 0:
+            first_video = Path(self.merge_list.item(0).text())
+            default_path = str(first_video.parent / "output" / f"{first_video.stem}_merged.mp4")
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Select Merge Output",
+            default_path,
+            "Video Files (*.mp4 *.mkv *.mov *.avi)",
+        )
+        if path:
+            self.merge_output_edit.setText(path)
+
+    def _collect_merge_video_paths(self) -> list[str]:
+        paths = []
+        for idx in range(self.merge_list.count()):
+            paths.append(self.merge_list.item(idx).text().strip())
+        return [path for path in paths if path]
+
     def _browse_srt(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
@@ -2086,6 +2350,97 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_timer()
         self.log_console.append("Process stopped by user.")
 
+    def _toggle_merge_processing(self):
+        if self.merge_worker and self.merge_worker.isRunning():
+            self._stop_merge_processing()
+            return
+        self._start_merge_processing()
+
+    def _start_merge_processing(self):
+        video_paths = self._collect_merge_video_paths()
+        if len(video_paths) < 2:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing Videos",
+                "Please select at least 2 videos to merge.",
+            )
+            return
+
+        output_path = self.merge_output_edit.text().strip()
+        if not output_path:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing Output",
+                "Please select an output file.",
+            )
+            return
+
+        self.merge_log_console.clear()
+        self.merge_progress_bar.setValue(0)
+        self.merge_status_label.setText("Starting...")
+
+        self.merge_worker = MergeWorkerThread(video_paths, output_path)
+        self.merge_worker.progress.connect(self.merge_progress_bar.setValue)
+        self.merge_worker.status.connect(self.merge_status_label.setText)
+        self.merge_worker.log.connect(self.merge_log_console.append)
+        self.merge_worker.finished.connect(self._handle_merge_finished)
+        self.merge_worker.failed.connect(self._handle_merge_failed)
+        self.merge_worker.stopped.connect(self._handle_merge_stopped)
+        self.merge_worker.started.connect(self._start_merge_timer)
+
+        self._set_merge_running_state(True)
+        self.merge_worker.start()
+
+    def _stop_merge_processing(self):
+        if not self.merge_worker or not self.merge_worker.isRunning():
+            return
+        self.merge_worker.stop()
+        self.merge_worker.wait(500)
+        if self.merge_worker.isRunning():
+            self.merge_worker.terminate()
+            self.merge_worker.wait(1000)
+        self._set_merge_running_state(False)
+        self.merge_status_label.setText("Stopped")
+        self.merge_progress_bar.setValue(0)
+        self._stop_merge_timer()
+        self.merge_log_console.append("Merge stopped by user.")
+
+    def _handle_merge_finished(self, output_path: str):
+        self._set_merge_running_state(False)
+        self._stop_merge_timer()
+        self.merge_status_label.setText("Done")
+        QtWidgets.QMessageBox.information(self, "Completed", f"Merged video saved to {output_path}")
+
+    def _handle_merge_failed(self, error: str):
+        self._set_merge_running_state(False)
+        self._stop_merge_timer()
+        self.merge_status_label.setText("Failed")
+        QtWidgets.QMessageBox.critical(self, "Merge Error", error)
+
+    def _handle_merge_stopped(self):
+        self._set_merge_running_state(False)
+        self._stop_merge_timer()
+        self.merge_status_label.setText("Stopped")
+        self.merge_progress_bar.setValue(0)
+
+    def _set_merge_running_state(self, running: bool):
+        if running:
+            self.merge_start_button.setText("Stop Merge")
+            self.merge_start_button.setStyleSheet("background-color: #c62828; color: #ffffff;")
+        else:
+            self.merge_start_button.setText("Start Merge")
+            self.merge_start_button.setStyleSheet(self._merge_start_button_default_style)
+
+        for widget in (
+            self.merge_add_button,
+            self.merge_remove_button,
+            self.merge_clear_button,
+            self.merge_list,
+            self.merge_output_edit,
+            self.merge_output_button,
+        ):
+            widget.setEnabled(not running)
+
     def _start_processing(self):
         self._user_stop_requested = False
         if self.tts_provider_combo.currentText() == "Custom API" and not self.config.custom_tts_url:
@@ -2170,6 +2525,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _stop_timer(self):
         self._timer.stop()
+
+    def _init_merge_timer(self):
+        self._merge_timer = QtCore.QTimer(self)
+        self._merge_timer.setInterval(1000)
+        self._merge_timer.timeout.connect(self._tick_merge_timer)
+        self._merge_elapsed_seconds = 0
+
+    def _start_merge_timer(self):
+        self._merge_elapsed_seconds = 0
+        self.merge_time_label.setText("Processing Time: 00:00")
+        self._merge_timer.start()
+
+    def _tick_merge_timer(self):
+        self._merge_elapsed_seconds += 1
+        minutes, seconds = divmod(self._merge_elapsed_seconds, 60)
+        self.merge_time_label.setText(f"Processing Time: {minutes:02d}:{seconds:02d}")
+
+    def _stop_merge_timer(self):
+        self._merge_timer.stop()
 
     def _session_config_path(self) -> Path:
         base_dir = self.config_manager.config_path.parent
