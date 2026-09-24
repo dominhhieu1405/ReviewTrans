@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.venv_build/
+.idea/
+build/
+dist/
+tmp/
+bin/
+.pytest_cache/
+
+# sinh ra khi build
+release/
+reviewtrans/_build_info.py
