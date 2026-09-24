@@ -21,6 +21,8 @@ Công cụ dịch, lồng tiếng và chèn phụ đề tự động cho video r
 - Trang riêng cho **Providers**, **Preset**, **Tài nguyên** (tải ffmpeg, whisper.cpp, model Whisper, libmpv),
   **Công cụ** (ghép video), **Cài đặt**.
 
+⬇️ **[Tải bản mới nhất (installer / portable)](https://github.com/dominhhieu1405/ReviewTrans/releases/latest)**
+
 📖 **[Hướng dẫn sử dụng đầy đủ (có ảnh minh hoạ)](docs/huong-dan-su-dung.md)**
 
 ## Chạy từ mã nguồn

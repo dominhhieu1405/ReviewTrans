@@ -33,20 +33,30 @@ thiếu Inno Setup thì script vẫn tạo zip portable và bỏ qua installer.
 
 Có thể chạy riêng từng bước: `python scripts\build.py tools|app|check|zip|installer`.
 
-## Build tự động trên GitHub
+## Build và phát hành tự động trên GitHub
 
 Workflow `.github/workflows/build.yml` (Windows runner):
 
-- Push lên `main`, mở pull request, hoặc bấm **Run workflow** trong tab Actions → chạy test rồi đóng gói;
-  file installer + zip nằm ở mục **Artifacts** của lần chạy (giữ 14 ngày).
-- Push tag phiên bản → tạo **GitHub Release** kèm installer + zip:
+| Sự kiện | Việc được làm |
+|---|---|
+| Mở / cập nhật pull request | Chỉ chạy test |
+| **Merge (push) vào `main`** | Test → đóng gói → **tự tạo release** |
+| Push tag `vX.Y.Z` | Đóng gói → tạo/cập nhật release cho tag đó |
+| Bấm **Run workflow** (tab Actions) | Đóng gói, file nằm ở mục **Artifacts** của lần chạy (giữ 14 ngày) |
 
-  ```bash
-  git tag v2.1.0
-  git push origin v2.1.0
-  ```
+Quy tắc tự tạo release khi merge vào `main`:
 
-  Tag có dấu gạch (vd. `v2.1.0-beta.1`) được đánh dấu là pre-release.
+- `APP_VERSION` trong `reviewtrans/__init__.py` **chưa có release** → tạo release chính thức `vX.Y.Z`,
+  đánh dấu **Latest**, kèm ghi chú thay đổi tự sinh từ các PR.
+- **Đã có** release của phiên bản đó → cập nhật release thử nghiệm **`nightly`** (luôn là bản build mới nhất của
+  `main`, thay file mỗi lần merge, không tạo thêm release rác).
+
+**Ra bản chính thức mới:** tăng `APP_VERSION` (ví dụ `2.0.0` → `2.1.0`) trong một PR rồi merge.
+
+Tải bản mới nhất: https://github.com/dominhhieu1405/ReviewTrans/releases/latest
+
+> File cài đặt nằm ở mục **Releases** (cột phải trang repo), không phải **Packages**: Packages của GitHub dành cho
+> gói npm/Docker/Maven… nên không dùng cho file `.exe`/`.zip`.
 
 ## Chế độ portable
 
