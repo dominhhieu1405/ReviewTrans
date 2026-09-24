@@ -1,51 +1,59 @@
-# PyInstaller build spec for Video Translation Studio
-
+# PyInstaller spec cho ReviewTrans Studio — thường được gọi qua scripts/build.py
+# Công cụ ngoài (ffmpeg, ffprobe, whisper, libmpv) lấy từ thư mục REVIEWTRANS_TOOLS (mặc định build/tools).
+import os
 from pathlib import Path
 
-app_dir = Path(SPECPATH)
+from PyInstaller.utils.hooks import collect_submodules
 
-block_cipher = None
+app_dir = Path(SPECPATH)
+tools_dir = Path(os.environ.get("REVIEWTRANS_TOOLS", app_dir / "build" / "tools"))
+version_file = os.environ.get("REVIEWTRANS_VERSION_FILE") or None
+
+datas = [(str(app_dir / "icon.ico"), "."), (str(app_dir / "icon.png"), ".")]
+if tools_dir.is_dir():
+    # để nguyên file .exe/.dll (datas) — không cho PyInstaller phân tích/sửa
+    datas += [(str(path), "bin") for path in sorted(tools_dir.iterdir()) if path.suffix.lower() in (".exe", ".dll")]
+
+hiddenimports = (
+    collect_submodules("reviewtrans")
+    + collect_submodules("google.genai")
+    + ["mpv", "edge_tts", "py7zr"]
+)
 
 a = Analysis(
     ["main.py"],
     pathex=[str(app_dir)],
     binaries=[],
-    datas=[
-        (str(app_dir / "bin"), "bin"),
-    ],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
+    excludes=["tkinter", "pytest", "pyflakes", "PyInstaller"],
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    name="VideoTranslationStudio",
-    icon=str(app_dir / 'icon.ico'),
+    [],
+    exclude_binaries=True,
+    name="ReviewTrans",
+    icon=str(app_dir / "icon.ico"),
+    version=version_file,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # UPX làm tăng cảnh báo nhầm của antivirus
     console=False,
 )
 
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
-    name="VideoTranslationStudio",
+    upx=False,
+    name="ReviewTrans",
 )

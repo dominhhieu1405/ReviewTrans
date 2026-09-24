@@ -1,5 +1,8 @@
-PyQt6
+PyQt6>=6.6
 requests
 edge-tts
 openai
 google-genai
+anthropic
+python-mpv
+py7zr
