@@ -380,8 +380,13 @@ class EditorPage(QtWidgets.QWidget):
         root.addWidget(self.body, 1)
 
         upper = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.upper_splitter = upper
+        self._layout_restored = False
+        self._user_layout = False  # người dùng đã tự kéo thanh chia → không tự chia lại nữa
+        upper.splitterMoved.connect(self._on_user_split)
         # --- trái: danh sách câu
         left = QtWidgets.QWidget()
+        left.setMinimumWidth(340)  # đủ chỗ cho cột câu gốc + bản dịch
         left_layout = QtWidgets.QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         search_row = QtWidgets.QHBoxLayout()
@@ -407,32 +412,42 @@ class EditorPage(QtWidgets.QWidget):
         frame_layout.setContentsMargins(0, 0, 0, 0)
         frame_layout.addWidget(self.canvas)
         center_layout.addWidget(frame, 1)
+        # hàng 1: điều khiển phát + âm lượng
         transport = QtWidgets.QHBoxLayout()
         transport.addWidget(tool_button("prev", "Câu trước (Ctrl+←)", lambda: self.jump_segment(-1)))
         self.play_button = tool_button("play", "Phát / dừng (Space)", self.backend.toggle)
         transport.addWidget(self.play_button)
         transport.addWidget(tool_button("next", "Câu sau (Ctrl+→)", lambda: self.jump_segment(1)))
         self.time_label = QtWidgets.QLabel("00:00.0 / 00:00.0")
-        self.time_label.setMinimumWidth(130)
+        self.time_label.setMinimumWidth(120)
         transport.addWidget(self.time_label)
         transport.addStretch()
-        self.sub_toggle = tool_button("text", "Bật/tắt phụ đề trong video xuất", checkable=True, text="Phụ đề")
-        self.dub_toggle = tool_button("speaker", "Bật/tắt lồng tiếng trong video xuất", checkable=True, text="Lồng tiếng")
-        transport.addWidget(self.sub_toggle)
-        transport.addWidget(self.dub_toggle)
-        self.listen_mode = ComboBox([("mix", "Nghe: bản trộn lồng tiếng"), ("original", "Nghe: âm gốc")])
-        transport.addWidget(self.listen_mode)
-        self.show_source = QtWidgets.QCheckBox("Hiện câu gốc")
-        transport.addWidget(self.show_source)
-        transport.addWidget(QtWidgets.QLabel("Âm lượng"))
+        volume_icon = QtWidgets.QLabel()
+        volume_icon.setPixmap(icon("volume").pixmap(16, 16))
+        volume_icon.setToolTip("Âm lượng xem thử")
+        transport.addWidget(volume_icon)
         self.volume = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setValue(90)
         self.volume.setFixedWidth(90)
         transport.addWidget(self.volume)
         center_layout.addLayout(transport)
+        # hàng 2: bật/tắt track khi xuất + chế độ nghe
+        options = QtWidgets.QHBoxLayout()
+        self.sub_toggle = tool_button("text", "Bật/tắt phụ đề trong video xuất", checkable=True, text="Phụ đề")
+        self.dub_toggle = tool_button("speaker", "Bật/tắt lồng tiếng trong video xuất", checkable=True, text="Lồng tiếng")
+        options.addWidget(self.sub_toggle)
+        options.addWidget(self.dub_toggle)
+        options.addStretch()
+        self.listen_mode = ComboBox([("mix", "Nghe: bản trộn"), ("original", "Nghe: âm gốc")])
+        self.listen_mode.setToolTip("Bản trộn = âm gốc đã chỉnh + lồng tiếng + nhạc nền, giống khi xuất")
+        options.addWidget(self.listen_mode)
+        self.show_source = QtWidgets.QCheckBox("Hiện câu gốc")
+        options.addWidget(self.show_source)
+        center_layout.addLayout(options)
         self.player_label = QtWidgets.QLabel()
         self.player_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        self.player_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
         center_layout.addWidget(self.player_label)
         upper.addWidget(center)
 
@@ -1386,6 +1401,45 @@ class EditorPage(QtWidgets.QWidget):
             message += f" (bỏ qua {skipped} video đang xử lý)"
         self.window().statusBar().showMessage(message, 5000)
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._layout_restored = True
+        QtCore.QTimer.singleShot(0, self._apply_layout)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self._layout_restored and not self._user_layout:
+            QtCore.QTimer.singleShot(0, self._apply_layout)
+
+    def _on_user_split(self, *_args) -> None:
+        if not self._applying_layout:
+            self._user_layout = True
+
+    _applying_layout = False
+
+    def _apply_layout(self) -> None:
+        """Chia khung theo tỉ lệ (đã lưu hoặc mặc định) dựa trên kích thước thật của cửa sổ."""
+        if self._user_layout:
+            return
+        self._applying_layout = True
+        saved = self.state.settings.window_state
+        width = self.upper_splitter.width()
+        upper = saved.get("editor_upper")
+        if not (isinstance(upper, list) and len(upper) == 3 and sum(upper) > 0):
+            upper = [34, 43, 23]
+        if width > 300:
+            self.upper_splitter.setSizes([int(width * part / sum(upper)) for part in upper])
+        body = saved.get("editor_body")
+        if not (isinstance(body, list) and len(body) == 2 and sum(body) > 0):
+            body = [68, 32]
+        height = self.body.height()
+        if height > 300:
+            self.body.setSizes([int(height * part / sum(body)) for part in body])
+        self._applying_layout = False
+
     def shutdown(self) -> None:
+        if self._layout_restored:
+            self.state.settings.window_state["editor_upper"] = self.upper_splitter.sizes()
+            self.state.settings.window_state["editor_body"] = self.body.sizes()
         self.save_now()
         self.backend.close()
