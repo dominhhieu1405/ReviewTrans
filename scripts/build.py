@@ -97,9 +97,10 @@ def fetch_tools(with_libmpv: bool = True, with_whisper: bool = True) -> None:
                     raise SystemExit("Gói whisper.cpp không có whisper-cli.exe")
             else:
                 log(f"whisper.cpp: dùng bản có sẵn ({exe.parent})")
+            downloaded = exe.parent.name.startswith("whisper_")  # gói tải về chỉ chứa whisper → lấy mọi DLL
             shutil.copy2(exe, TOOLS / exe.name)
             for dll in exe.parent.glob("*.dll"):
-                if dll.name.lower().startswith(WHISPER_DLL_PREFIXES):
+                if downloaded or dll.name.lower().startswith(WHISPER_DLL_PREFIXES):
                     shutil.copy2(dll, TOOLS / dll.name)
         else:
             log("whisper.cpp: đã có")
@@ -206,7 +207,8 @@ def self_check(require: list[str]) -> None:
             log(f"  ✕ {name}: {state}")
     log(f"  libmpv: {data.get('libmpv')}")
     for tool, path in data.get("tools", {}).items():
-        log(f"  {tool}: {path or 'THIẾU'}")
+        run = data.get("runs", {}).get(tool)
+        log(f"  {tool}: {path or 'THIẾU'}" + (f" (chạy thử: mã {run})" if run is not None else ""))
     if code != 0 or not data.get("ok"):
         raise SystemExit("Tự kiểm tra thất bại — xem build/selfcheck.json")
     log("  ✓ đủ thư viện và công cụ")

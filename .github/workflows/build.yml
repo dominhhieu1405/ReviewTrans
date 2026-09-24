@@ -37,10 +37,11 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
+      GITHUB_TOKEN: ${{ github.token }}  # tải release whisper.cpp/libmpv qua API không bị giới hạn
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -66,10 +67,10 @@ jobs:
           Write-Host "Phiên bản: $v"
 
       - name: Cache công cụ (ffmpeg, whisper, libmpv)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/tools
-          key: tools-${{ runner.os }}-v1-${{ hashFiles('scripts/build.py') }}
+          key: tools-${{ runner.os }}-v2-${{ hashFiles('scripts/build.py') }}
 
       - name: Gom công cụ
         run: |
@@ -96,7 +97,7 @@ jobs:
           python scripts/build.py all @flags
 
       - name: Tải lên Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ReviewTrans-${{ steps.version.outputs.value }}
           path: |
@@ -107,7 +108,7 @@ jobs:
 
       - name: Tạo GitHub Release
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ReviewTrans Studio ${{ steps.version.outputs.value }}
           files: |

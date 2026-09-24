@@ -98,13 +98,28 @@ def download_ffmpeg(progress: ProgressFn = _noop, stop=None, bin_dir: Path | Non
 # ------------------------------------------------------------------ whisper
 
 
+def _github_headers() -> dict:
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "ReviewTrans"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:  # CI: tránh giới hạn 60 request/giờ của API không đăng nhập
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _github_asset(repo: str, predicate) -> tuple[str, str]:
-    response = requests.get(f"https://api.github.com/repos/{repo}/releases/latest", timeout=30)
+    """Tìm file phù hợp trong các release gần nhất (không chỉ release "latest":
+    whisper.cpp đăng bản build ở các release riêng như b5130, còn release v1.x.y có thể không kèm file)."""
+    response = requests.get(
+        f"https://api.github.com/repos/{repo}/releases", params={"per_page": 30}, headers=_github_headers(), timeout=30
+    )
     response.raise_for_status()
-    for asset in response.json().get("assets", []):
-        if predicate(asset["name"]):
-            return asset["name"], asset["browser_download_url"]
-    raise FileNotFoundError(f"Không tìm thấy bản build phù hợp trong {repo}")
+    for release in response.json():
+        if release.get("draft"):
+            continue
+        for asset in release.get("assets", []):
+            if predicate(asset["name"]):
+                return asset["name"], asset["browser_download_url"]
+    raise FileNotFoundError(f"Không tìm thấy bản build phù hợp trong 30 release gần nhất của {repo}")
 
 
 def download_whisper_binaries(progress: ProgressFn = _noop, stop=None, bin_dir: Path | None = None) -> Path:
