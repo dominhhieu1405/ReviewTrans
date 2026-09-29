@@ -341,6 +341,11 @@ xem trước ở giữa. Áp preset trong Editor ở tab Phụ đề.
 
 - **Công cụ**: FFmpeg (bắt buộc), whisper.cpp (nhận dạng), libmpv (player mượt hơn, tua chính xác). Bấm
   **Tải / cập nhật** để tải bản mới. Sau khi tải libmpv, khởi động lại app.
+- **whisper.cpp chạy bằng GPU** (tuỳ chọn, nhận dạng nhanh gấp nhiều lần CPU):
+  - **CUDA (NVIDIA)**: bản chính thức của whisper.cpp. App tự chọn gói phù hợp với card: ≈270 MB cho GTX 900 → RTX 30,
+    ≈680 MB cho RTX 40/50.
+  - **Vulkan (AMD / Intel / NVIDIA)**: chạy trên mọi card có driver Vulkan. Bản cài đặt đã kèm sẵn bản này.
+  - Tải xong, app tự dùng GPU cho bước Nhận dạng. Nếu bản GPU lỗi (driver cũ, thiếu VRAM…), app tự chạy lại bằng CPU.
 - **Model Whisper**: *Lấy danh sách đầy đủ* từ Hugging Face, chọn rồi *Tải model đã chọn*.
   Model càng lớn càng chính xác nhưng càng chậm; bản `-q5` nhẹ hơn.
 - **Lưu trữ**: xem dung lượng cache của project, **dọn cache** (giữ lại file lồng tiếng từng câu), mở thư mục dữ liệu
@@ -360,12 +365,20 @@ Video khác định dạng thì tích **Mã hoá lại**.
 
 - Thư mục chứa project, ngôn ngữ mặc định.
 - **Player**: tự động (libmpv nếu có), libmpv hoặc Qt. Đổi xong cần khởi động lại.
-- Model Whisper mặc định, số luồng Whisper, **số câu mỗi lần dịch** (giảm nếu LLM hay trả thiếu dòng),
-  số luồng TTS song song.
+- Model Whisper mặc định, **Whisper chạy trên** (Tự động / CUDA / Vulkan / Chỉ CPU), số luồng CPU của Whisper
+  (*Tự động* = theo số nhân CPU), **số câu mỗi lần dịch** (giảm nếu LLM hay trả thiếu dòng), số luồng TTS song song.
 - **Xuất video**:
-  - Codec: H.264/H.265 bằng CPU, hoặc NVENC nếu có card NVIDIA (nhanh hơn nhiều).
-  - CRF/CQ: nhỏ = đẹp hơn, 18–23 là hợp lý.
-  - Preset và bitrate âm thanh.
+  - Codec: mặc định **Tự động H.264**, tức dùng bộ mã hoá GPU nếu máy có, không thì dùng CPU (x264). Có thể chọn cụ thể:
+    NVIDIA NVENC, AMD AMF, Intel Quick Sync, Windows Media Foundation (mọi GPU), hoặc x264/x265 bằng CPU.
+    *Tự động H.265* cho file nhỏ hơn.
+  - CRF/CQ: nhỏ = đẹp hơn, 18–23 là hợp lý. Áp dụng cho cả bộ mã hoá GPU.
+  - Preset (chỉ cho x264/x265) và bitrate âm thanh.
+  - *Giải mã video nguồn bằng GPU*: thường không nhanh hơn nhiều vì các bước làm mờ/chèn phụ đề vẫn chạy trên CPU.
+- **Tăng tốc phần cứng**: danh sách GPU, các bộ mã hoá GPU **đã chạy thử thành công** trên máy, bộ mã hoá sẽ dùng
+  khi xuất, và các bản whisper đang có. Bấm **Dò lại phần cứng** sau khi đổi card hoặc cập nhật driver.
+
+> Ví dụ trên laptop Radeon RX 5300M: xuất 60 giây video 1080p có vùng che mờ mất 13 giây bằng AMF, còn x264 (CPU) mất 27 giây.
+> Nếu GPU lỗi giữa chừng khi xuất, app tự thử lại, rồi chuyển sang bộ mã hoá GPU khác hoặc CPU, không cần làm gì thêm.
 
 ## 14. Phím tắt
 
@@ -400,6 +413,14 @@ Vào Tài nguyên tải libmpv rồi khởi động lại. Nếu vẫn lỗi, ch
 **Không nhận dạng được (Whisper lỗi)?**
 Kiểm tra whisper.cpp và model ở trang Tài nguyên, và chọn đúng ngôn ngữ gốc. Video không có tiếng nói rõ
 (chỉ có nhạc) thì Whisper có thể trả về rất ít câu.
+
+**Xuất video không dùng GPU / log ghi “… chạy thử lỗi”?**
+Vào Cài đặt → Tăng tốc phần cứng xem bộ mã hoá nào dùng được, bấm *Dò lại phần cứng* sau khi cập nhật driver card màn hình.
+Laptop hai GPU AMD với driver cũ đôi khi từ chối mở AMF; khi đó app dùng Media Foundation hoặc CPU thay thế.
+
+**Nhận dạng vẫn chạy bằng CPU?**
+Log của job ghi rõ bản whisper đang dùng (dòng *Whisper chạy bằng …*). Tải bản CUDA/Vulkan ở trang Tài nguyên.
+Nếu log có *Whisper Vulkan lỗi → thử bản CPU*, hãy cập nhật driver card màn hình, hoặc chọn *Chỉ CPU* trong Cài đặt.
 
 **Phụ đề trong video xuất dùng sai font?**
 Font cần được cài vào Windows, hoặc chép vào *thư mục font* (Tài nguyên → Thư mục font).

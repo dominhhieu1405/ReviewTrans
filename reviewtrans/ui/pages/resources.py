@@ -8,6 +8,8 @@ from ...core.pipeline.resources import (
     download_ffmpeg,
     download_libmpv,
     download_whisper_binaries,
+    download_whisper_cuda,
+    download_whisper_vulkan,
     downloaded_whisper_models,
     ensure_whisper_model,
     fetch_whisper_models,
@@ -17,12 +19,19 @@ from ...core.pipeline.resources import (
 from ...core.store import ProjectStore
 from ..jobs import run_background
 from ..state import AppState
-from ..theme import DANGER, SUCCESS
+from ..theme import DANGER, SUCCESS, TEXT_DIM
 from ..widgets.common import confirm, error, hint, human_size, open_path, push_button, title_label
 
+OPTIONAL = {"whisper-cuda", "whisper-vulkan"}
 TOOLS = [
     ("ffmpeg", "FFmpeg + FFprobe", "Bắt buộc: tách âm, trộn âm, xuất video.", download_ffmpeg),
-    ("whisper", "whisper.cpp", "Nhận dạng giọng nói (ASR) offline.", download_whisper_binaries),
+    ("whisper", "whisper.cpp (CPU)", "Nhận dạng giọng nói (ASR) offline, chạy mọi máy.", download_whisper_binaries),
+    ("whisper-cuda", "whisper.cpp CUDA (NVIDIA)",
+     "ASR bằng GPU NVIDIA (GTX 900 trở lên), nhanh gấp nhiều lần CPU. Gói ≈270 MB (RTX 40/50: ≈680 MB).",
+     download_whisper_cuda),
+    ("whisper-vulkan", "whisper.cpp Vulkan (AMD / Intel / NVIDIA)",
+     "ASR bằng mọi GPU có driver Vulkan. Bản do ReviewTrans tự build (whisper.cpp không phát hành cho Windows).",
+     download_whisper_vulkan),
     ("libmpv", "libmpv (player)", "Player mượt, seek chính xác, xem trước blur thật. Không có sẽ dùng Qt Multimedia.", download_libmpv),
 ]
 
@@ -105,8 +114,9 @@ class ResourcesPage(QtWidgets.QWidget):
                 ok = bool(status[key])
                 text = status[key] or "Chưa có"
             label = self.tool_labels[key]
-            label.setText(("✓ " if ok else "✕ ") + text)
-            label.setStyleSheet(f"color: {SUCCESS if ok else DANGER};")
+            optional = key in OPTIONAL and not ok
+            label.setText(("✓ " if ok else "– " if optional else "✕ ") + (text if not optional else "Chưa tải (tuỳ chọn)"))
+            label.setStyleSheet(f"color: {SUCCESS if ok else TEXT_DIM if optional else DANGER};")
         downloaded = set(downloaded_whisper_models())
         models = sorted(set(self._all_models) | downloaded)
         self.models.setRowCount(len(models))
@@ -126,6 +136,8 @@ class ResourcesPage(QtWidgets.QWidget):
             bar.setVisible(False)
             self.refresh()
             note = " Khởi động lại ứng dụng để dùng player libmpv." if key == "libmpv" else ""
+            if key.startswith("whisper-"):
+                note = " Whisper sẽ tự dùng GPU (xem Cài đặt → Tăng tốc phần cứng)."
             self.window().statusBar().showMessage(f"Đã tải xong {key}.{note}", 8000)
 
         def fail(message: str) -> None:

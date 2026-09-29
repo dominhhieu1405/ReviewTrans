@@ -16,6 +16,8 @@ from ..paths import find_libmpv, find_tool, models_dir, user_bin_dir
 from ..proc import subprocess_kwargs
 
 WHISPER_REPO = "ggerganov/whisper.cpp"
+APP_REPO = "dominhhieu1405/ReviewTrans"  # release của app kèm bản whisper.cpp Vulkan tự build
+VULKAN_ASSET = "whisper-vulkan-x64.zip"
 ProgressFn = Callable[[float, str], None]
 
 KNOWN_WHISPER_MODELS = [
@@ -55,6 +57,11 @@ def tool_status() -> dict[str, str]:
         status[name] = str(path) if path else ""
     mpv = find_libmpv()
     status["libmpv"] = str(mpv) if mpv else ""
+    from ..hardware import whisper_variants
+
+    variants = whisper_variants()
+    for variant in ("cuda", "vulkan"):
+        status[f"whisper-{variant}"] = str(variants[variant]) if variant in variants else ""
     return status
 
 
@@ -139,6 +146,47 @@ def download_whisper_binaries(progress: ProgressFn = _noop, stop=None, bin_dir: 
         return bin_dir
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _install_whisper_zip(url: str, name: str, target: Path, progress: ProgressFn, stop, label: str) -> Path:
+    """Tải một gói whisper.cpp và chép toàn bộ exe/dll vào thư mục riêng (DLL ggml mỗi bản một khác)."""
+    work = Path(tempfile.mkdtemp(prefix="whisper_dl_"))
+    try:
+        archive = download_file(url, work / name, progress, stop, label)
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(work / "x")
+        files = [p for p in (work / "x").rglob("*") if p.is_file() and p.suffix.lower() in (".exe", ".dll")]
+        if not any(p.stem.lower() in ("whisper-cli", "whisper", "main") and p.suffix.lower() == ".exe" for p in files):
+            raise RuntimeError(f"Gói {name} không có whisper-cli.exe")
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+        for path in files:
+            shutil.copy2(path, target / path.name)
+        return target
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def download_whisper_cuda(progress: ProgressFn = _noop, stop=None, bin_dir: Path | None = None) -> Path:
+    """whisper.cpp bản CUDA (NVIDIA) chính thức. Chọn gói 11.8 (≈270 MB) hoặc 12.4 (≈680 MB, cho RTX 40/50)."""
+    if not platform.system().lower().startswith("win"):
+        raise RuntimeError("Hãy tự build whisper.cpp với -DGGML_CUDA=ON rồi đặt vào thư mục bin/whisper-cuda.")
+    from ..hardware import cuda_package, detect
+
+    version = cuda_package(detect())
+    wanted = f"whisper-cublas-{version}-bin-x64.zip"
+    name, url = _github_asset("ggml-org/whisper.cpp", lambda n: n == wanted)
+    return _install_whisper_zip(url, name, (bin_dir or user_bin_dir()) / "whisper-cuda", progress, stop, f"whisper CUDA {version}")
+
+
+def download_whisper_vulkan(progress: ProgressFn = _noop, stop=None, bin_dir: Path | None = None) -> Path:
+    """whisper.cpp bản Vulkan (AMD/Intel/NVIDIA). whisper.cpp không phát hành bản này cho Windows
+    nên CI của ReviewTrans tự build và đính kèm vào release."""
+    if not platform.system().lower().startswith("win"):
+        raise RuntimeError("Hãy tự build whisper.cpp với -DGGML_VULKAN=ON rồi đặt vào thư mục bin/whisper-vulkan.")
+    name, url = _github_asset(APP_REPO, lambda n: n == VULKAN_ASSET)
+    return _install_whisper_zip(url, name, (bin_dir or user_bin_dir()) / "whisper-vulkan", progress, stop, "whisper Vulkan")
 
 
 def fetch_whisper_models() -> list[str]:

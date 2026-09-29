@@ -5,10 +5,11 @@ from pathlib import Path
 from PyQt6 import QtCore, QtWidgets
 
 from .. import APP_NAME, APP_VERSION
+from ..core import hardware
 from ..core.paths import find_tool
 from ..core.store import ProjectStore
 from .icons import icon
-from .jobs import RUNNING
+from .jobs import RUNNING, run_background
 from .pages.editor import EditorPage
 from .pages.presets import PresetsPage
 from .pages.projects import ProjectsPage
@@ -149,6 +150,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not find_tool("ffmpeg") or not find_tool("ffprobe"):
             if confirm(self, "Thiếu FFmpeg", "Chưa có FFmpeg — cần để xử lý video. Mở trang Tài nguyên để tải ngay?"):
                 self.navigate("resources")
+        elif hardware.load_cached() is None:
+            # dò GPU sẵn ở nền để lần xuất video đầu tiên khỏi phải chờ
+            self._hw_thread = run_background(lambda _p, _s: hardware.detect(), lambda _info: None, lambda _msg: None)
 
     def _restore_geometry(self) -> None:
         state = self.state.settings.window_state

@@ -13,6 +13,9 @@ datas = [(str(app_dir / "icon.ico"), "."), (str(app_dir / "icon.png"), ".")]
 if tools_dir.is_dir():
     # để nguyên file .exe/.dll (datas) — không cho PyInstaller phân tích/sửa
     datas += [(str(path), "bin") for path in sorted(tools_dir.iterdir()) if path.suffix.lower() in (".exe", ".dll")]
+    # bản whisper GPU nằm trong thư mục con riêng (bin/whisper-vulkan, bin/whisper-cuda) vì DLL ggml khác nhau
+    for sub in sorted(p for p in tools_dir.iterdir() if p.is_dir() and p.name.startswith("whisper-")):
+        datas += [(str(path), f"bin/{sub.name}") for path in sorted(sub.iterdir()) if path.suffix.lower() in (".exe", ".dll")]
 
 hiddenimports = (
     collect_submodules("reviewtrans")

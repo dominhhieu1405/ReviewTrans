@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..ass import build_ass
 from ..config import RenderSettings
 from ..geometry import layer_rect
+from ..hardware import EncoderConfig, detect, load_cached, mark_failed, probe_encoder, quality_args, resolve_encoder
 from ..paths import fonts_dir
 from ..models import LAYER_BLUR, LAYER_IMAGE, LAYER_TEXT, Layer, Segment, VideoDoc, clone
 from ..proc import parse_progress_time, require_tool, run
@@ -63,6 +65,8 @@ def build_render_plan(
     length: float | None = None,
     image_size_fn=None,
     text_raster_fn=None,
+    encoder: EncoderConfig | None = None,
+    hwaccel_decode: bool | None = None,
 ) -> RenderPlan:
     """Dịch mô hình timeline thành lệnh ffmpeg. `start/length` dùng cho xuất thử một đoạn."""
     ffmpeg = require_tool("ffmpeg")
@@ -71,9 +75,15 @@ def build_render_plan(
     duration = doc.duration if length is None else min(length, max(0.1, doc.duration - start))
     offset = start
 
+    if encoder is None:
+        encoder = resolve_encoder(render.video_codec, load_cached())[0]
+    if hwaccel_decode is None:
+        hwaccel_decode = render.hwaccel_decode
+
     command = [str(ffmpeg), "-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]
-    if render.hwaccel_decode:
+    if hwaccel_decode:
         command += ["-hwaccel", "auto"]
+    command += encoder.pre_args
     if start > 0:
         command += ["-ss", f"{start:.3f}"]
     if length is not None:
@@ -172,7 +182,7 @@ def build_render_plan(
             current = label
 
     label = "[vout]"
-    parts.append(f"{current}format=yuv420p{label}")
+    parts.append(f"{current}{encoder.tail}{label}")
     graph = ";".join(parts)
 
     audio_index = None
@@ -194,12 +204,7 @@ def build_render_plan(
     else:
         command += ["-an"]
 
-    codec = render.video_codec
-    command += ["-c:v", codec]
-    if "nvenc" in codec:
-        command += ["-preset", "p5", "-rc", "vbr", "-cq", str(render.crf)]
-    else:
-        command += ["-preset", render.preset, "-crf", str(render.crf)]
+    command += ["-c:v", encoder.codec, *quality_args(encoder.codec, render.crf, render.preset), *encoder.args]
     command += ["-shortest", "-movflags", "+faststart", str(output)]
     return RenderPlan(command=command, cwd=work_dir, duration=duration, output=output, graph=graph, inputs=inputs)
 
@@ -207,6 +212,32 @@ def build_render_plan(
 def output_path(ctx: RunContext, doc: VideoDoc, suffix: str = "") -> Path:
     folder = ctx.store.output_dir(ctx.project)
     return folder / f"{slugify(doc.name)}{suffix}.mp4"
+
+
+def choose_encoder(ctx: RunContext, exclude: set[str] | None = None) -> tuple[EncoderConfig, bool]:
+    """Bộ mã hoá sẽ dùng + có giải mã bằng GPU không. Bộ mã hoá GPU được chạy thử trước (cũng để đánh thức GPU rời).
+    Bộ nào chạy thử lỗi được thêm vào `exclude` (chỉ cho lần xuất này — lỗi driver thường chập chờn)."""
+    exclude = set() if exclude is None else exclude
+    render = ctx.settings.render
+    if render.video_codec in ("libx264", "libx265"):
+        return resolve_encoder(render.video_codec, None)[0], render.hwaccel_decode
+    info = load_cached()
+    if info is None:
+        ctx.progress(0, "Dò bộ mã hoá GPU")
+        info = detect(log=ctx.log)
+    ffmpeg = require_tool("ffmpeg")
+    while True:
+        encoder, note = resolve_encoder(render.video_codec, info, exclude)
+        if note:
+            ctx.log(note)
+        if not encoder.hardware:
+            return encoder, render.hwaccel_decode
+        ok, message = probe_encoder(ffmpeg, encoder)
+        if ok:
+            ctx.log(f"Mã hoá bằng GPU: {encoder.codec} ({encoder.device})")
+            return encoder, render.hwaccel_decode
+        ctx.log(f"{encoder.codec} chạy thử lỗi: {message}")
+        exclude.add(encoder.codec)
 
 
 def run_render(
@@ -224,30 +255,60 @@ def run_render(
     if output is None:
         output = output_path(ctx, doc, "_thu" if length is not None else "")
     output.parent.mkdir(parents=True, exist_ok=True)
-    plan = build_render_plan(
-        doc, segments, ctx.settings.render, work_dir, output, mix_audio, start, length,
-        image_size_fn=image_size, text_raster_fn=render_text_layer_png,
-    )
+    excluded: set[str] = set()
+    encoder, hwaccel = choose_encoder(ctx, excluded)
+
+    def plan_for(config: EncoderConfig, hw_decode: bool) -> RenderPlan:
+        return build_render_plan(
+            doc, segments, ctx.settings.render, work_dir, output, mix_audio, start, length,
+            image_size_fn=image_size, text_raster_fn=render_text_layer_png, encoder=config, hwaccel_decode=hw_decode,
+        )
+
+    plan = plan_for(encoder, hwaccel)
     ctx.log("Filter: " + plan.graph[:2000])
+    started = time.monotonic()
 
-    def on_line(line: str) -> None:
-        if line.startswith("out_time=") and plan.duration > 0:
-            seconds = parse_progress_time(line.split("=", 1)[1])
-            ctx.progress(min(99.0, seconds * 100.0 / plan.duration), f"Xuất video {seconds:.0f}/{plan.duration:.0f}s")
+    def execute(plan: RenderPlan) -> tuple[int, list[str]]:
+        tail: list[str] = []
 
-    tail: list[str] = []
+        def collect(line: str) -> None:
+            if line.startswith("out_time=") and plan.duration > 0:
+                seconds = parse_progress_time(line.split("=", 1)[1])
+                ctx.progress(min(99.0, seconds * 100.0 / plan.duration), f"Xuất video {seconds:.0f}/{plan.duration:.0f}s")
+            if "=" not in line or " " in line:
+                tail.append(line)
+                del tail[:-20]
 
-    def collect(line: str) -> None:
-        on_line(line)
-        if "=" not in line or " " in line:
-            tail.append(line)
-            del tail[:-20]
+        return run(plan.command, log=None, stop_event=ctx.stop_event, cwd=plan.cwd, line_cb=collect), tail
 
-    code = run(plan.command, log=None, stop_event=ctx.stop_event, cwd=plan.cwd, line_cb=collect)
-    if code != 0:
+    retries: dict[str, int] = {}
+    while True:
+        code, tail = execute(plan)
+        if code == 0:
+            break
         for line in tail:
             ctx.log(line)
-        raise RuntimeError("Xuất video thất bại (xem log).")
+        if encoder.hardware:
+            # driver GPU đôi khi từ chối mở bộ mã hoá (AMF lỗi 30…) — lỗi xảy ra ngay, thử lại rất rẻ
+            opening = any("Error while opening encoder" in line or "CreateComponent" in line for line in tail)
+            if opening and retries.get(encoder.codec, 0) < 3:
+                retries[encoder.codec] = retries.get(encoder.codec, 0) + 1
+                ctx.log(f"{encoder.codec} chưa mở được, thử lại ({retries[encoder.codec]}/3)")
+                time.sleep(0.2)
+                continue
+            if not opening:
+                mark_failed(encoder.codec)  # lỗi giữa chừng: bỏ bộ này cho cả phiên làm việc
+            excluded.add(encoder.codec)
+            previous = encoder.codec
+            encoder, hwaccel = choose_encoder(ctx, excluded)
+            ctx.log(f"Xuất bằng {previous} thất bại → xuất lại bằng {encoder.codec}")
+        elif hwaccel:
+            hwaccel = False
+            ctx.log("Giải mã bằng GPU lỗi → xuất lại, giải mã bằng CPU")
+        else:
+            raise RuntimeError("Xuất video thất bại (xem log).")
+        plan = plan_for(encoder, hwaccel)
+    ctx.log(f"Thời gian xuất: {time.monotonic() - started:.1f}s")
     ctx.progress(100, "Đã xuất video")
     ctx.log(f"Đã xuất: {output}")
     # Kèm file phụ đề SRT

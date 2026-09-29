@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,9 +47,12 @@ class ProviderProfile:
         return self.kind in LLM_KINDS
 
 
+SETTINGS_VERSION = 2
+
+
 @dataclass
 class RenderSettings:
-    video_codec: str = "libx264"  # libx264 | libx265 | h264_nvenc | hevc_nvenc
+    video_codec: str = "auto"  # auto | auto_hevc | libx264 | h264_nvenc | h264_amf | … (xem hardware.CODECS)
     crf: int = 20
     preset: str = "medium"
     audio_bitrate: str = "192k"
@@ -65,7 +69,8 @@ class AppSettings:
     default_translate_profile: str = ""
     default_tts_profile: str = ""
     default_whisper_model: str = "small"
-    whisper_threads: int = 4
+    whisper_threads: int = 0  # 0 = tự động theo số nhân CPU
+    asr_device: str = "auto"  # auto | cuda | vulkan | cpu
     translate_batch_size: int = 60
     tts_concurrency: int = 3
     player_backend: str = "auto"  # auto | mpv | qt
@@ -74,6 +79,7 @@ class AppSettings:
     tts_profiles: list[ProviderProfile] = field(default_factory=list)
     subtitle_presets: list[SubtitleStyle] = field(default_factory=list)
     window_state: dict = field(default_factory=dict)
+    settings_version: int = SETTINGS_VERSION
 
     def projects_root_path(self) -> Path:
         return Path(self.projects_root) if self.projects_root else default_projects_root()
@@ -125,6 +131,23 @@ def default_settings() -> AppSettings:
     return settings
 
 
+def upgrade_settings(settings: AppSettings, version: int) -> None:
+    """Nâng cấp settings.json của phiên bản trước."""
+    if version < 2:
+        # 2.1: tăng tốc phần cứng — giá trị mặc định cũ chuyển sang tự động
+        if settings.render.video_codec == "libx264":
+            settings.render.video_codec = "auto"
+        if settings.whisper_threads == 4:
+            settings.whisper_threads = 0
+    settings.settings_version = SETTINGS_VERSION
+
+
+def whisper_thread_count(value: int) -> int:
+    if value > 0:
+        return value
+    return max(1, min(8, (os.cpu_count() or 4) - 1))
+
+
 def migrate_legacy(data: dict, settings: AppSettings) -> None:
     """Chuyển config.json của bản cũ thành các profile."""
     gemini_keys = [k for k in data.get("gemini_api_keys", []) if str(k).strip()]
@@ -173,6 +196,7 @@ class SettingsStore:
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
                 settings = from_dict(AppSettings, data)
+                upgrade_settings(settings, int(data.get("settings_version", 1)))
                 if not settings.subtitle_presets:
                     settings.subtitle_presets = builtin_presets()
                 return settings
