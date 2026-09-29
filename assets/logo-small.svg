@@ -1,15 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="ReviewTrans Studio">
-  <!-- Bản giản lược cho cỡ nhỏ (16–48 px): một bong bóng thoại có nút phát + một dòng phụ đề -->
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="256" y2="256" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#3B82FF"/>
-      <stop offset="1" stop-color="#7C4DFF"/>
-    </linearGradient>
-  </defs>
-  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
-  <path d="M76 40H180A36 36 0 0 1 216 76V132A36 36 0 0 1 180 168L196 198L150 168H76A36 36 0 0 1 40 132V76A36 36 0 0 1 76 40Z"
-        fill="#FFFFFF"/>
-  <path d="M108 78C108 72.6 113.9 69.3 118.5 72.1L158.5 97.1C162.8 99.8 162.8 106.2 158.5 108.9L118.5 133.9C113.9 136.7 108 133.4 108 128Z"
-        fill="url(#bg)"/>
-  <rect x="44" y="206" width="168" height="20" rx="10" fill="#FFFFFF"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" aria-label="ReviewTrans Studio" role="img" viewBox="0 0 256 256"><defs><linearGradient id="bg" x1="0" x2="256" y1="0" y2="256" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#3B82FF"/><stop offset="1" stop-color="#7C4DFF"/></linearGradient></defs><rect width="256" height="256" fill="url(#bg)" rx="56"/><path fill="#FFF" d="M76 40H180A36 36 0 0 1 216 76V132A36 36 0 0 1 180 168L196 198L150 168H76A36 36 0 0 1 40 132V76A36 36 0 0 1 76 40Z"/><path fill="url(#bg)" d="M108 78C108 72.6 113.9 69.3 118.5 72.1L158.5 97.1C162.8 99.8 162.8 106.2 158.5 108.9L118.5 133.9C113.9 136.7 108 133.4 108 128Z"/><rect width="168" height="20" x="44" y="206" fill="#FFF" rx="10"/></svg>
