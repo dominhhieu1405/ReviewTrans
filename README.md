@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" width="128" alt="ReviewTrans Studio"></p>
+
 # ReviewTrans Studio
 
 Công cụ dịch, lồng tiếng và chèn phụ đề tự động cho video review phim, với giao diện kiểu phần mềm dựng video.
@@ -18,6 +20,8 @@ Công cụ dịch, lồng tiếng và chèn phụ đề tự động cho video r
 - **Layer**: ảnh (logo), chữ, vùng che (làm mờ / pixel hoá / tô màu) để che chữ cứng của video gốc.
   Kéo thả trên khung phát và trên timeline.
 - **Hàng đợi**: chạy hàng loạt Nhận dạng → Dịch → Cập nhật ngữ cảnh → Lồng tiếng → Trộn âm → Xuất video.
+- **Tăng tốc phần cứng**: xuất video bằng GPU (NVIDIA NVENC, AMD AMF, Intel Quick Sync, Media Foundation), tự dò và
+  chạy thử trước khi dùng, lỗi thì tự chuyển về CPU. Nhận dạng giọng nói bằng GPU qua whisper.cpp CUDA hoặc Vulkan.
 - Trang riêng cho **Providers**, **Preset**, **Tài nguyên** (tải ffmpeg, whisper.cpp, model Whisper, libmpv),
   **Công cụ** (ghép video), **Cài đặt**.
 

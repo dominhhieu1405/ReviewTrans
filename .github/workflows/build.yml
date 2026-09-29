@@ -7,6 +7,10 @@
 #    Muốn ra bản chính thức mới: tăng APP_VERSION rồi merge vào main.
 #  - Push tag vX.Y.Z      → đóng gói và tạo/cập nhật release cho tag đó.
 #  - Chạy tay (Run workflow) → đóng gói, file nằm ở mục Artifacts của lần chạy.
+#
+#  Job whisper-vulkan tự build whisper.cpp với backend Vulkan (whisper.cpp không phát hành bản này cho
+#  Windows) để nhận dạng giọng nói bằng GPU AMD/Intel/NVIDIA. Kết quả được cache theo phiên bản
+#  whisper.cpp; nếu job này lỗi, bản build vẫn ra bình thường (chỉ thiếu whisper Vulkan).
 name: Build
 
 on:
@@ -73,8 +77,61 @@ jobs:
           REVIEWTRANS_EXTRA_BIN: ${{ github.workspace }}\build\tools
         run: python -m pytest -q
 
-  build:
+  whisper-vulkan:
     if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      VULKAN_VERSION: 1.4.357.0
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Phiên bản whisper.cpp
+        id: ref
+        run: |
+          $ref = python -c "import sys; sys.path.insert(0, '.'); from scripts.build import WHISPER_CPP_REF; print(WHISPER_CPP_REF)"
+          "value=$ref" >> $env:GITHUB_OUTPUT
+
+      - name: Cache bản build
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: build/whisper-vulkan-x64.zip
+          key: whisper-vulkan-${{ steps.ref.outputs.value }}-vk${{ env.VULKAN_VERSION }}-v1
+
+      - name: Cài Vulkan SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          curl.exe -fsSL -o $installer "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          Start-Process -FilePath $installer -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait -NoNewWindow
+          if (-not (Test-Path "C:\VulkanSDK\$env:VULKAN_VERSION\Bin\glslc.exe")) { throw "Cài Vulkan SDK thất bại" }
+          "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION" >> $env:GITHUB_ENV
+          "C:\VulkanSDK\$env:VULKAN_VERSION\Bin" >> $env:GITHUB_PATH
+
+      - name: Build whisper.cpp (Vulkan)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python scripts/build.py whisper-vulkan
+
+      - name: Tải lên Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: whisper-vulkan
+          path: build/whisper-vulkan-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: whisper-vulkan
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
@@ -125,10 +182,21 @@ jobs:
           path: build/tools
           key: tools-${{ runner.os }}-v2-${{ hashFiles('scripts/build.py') }}
 
+      - name: Lấy whisper.cpp Vulkan từ job trước
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: whisper-vulkan
+          path: build/vulkan-artifact
+
       - name: Gom công cụ
         run: |
           $flags = @()
           if ("${{ inputs.libmpv }}" -eq "false") { $flags += "--no-libmpv" }
+          if (Test-Path build/vulkan-artifact/whisper-vulkan-x64.zip) {
+            $flags += @("--whisper-vulkan", "build/vulkan-artifact/whisper-vulkan-x64.zip")
+            Copy-Item build/vulkan-artifact/whisper-vulkan-x64.zip release-extra-whisper-vulkan-x64.zip
+          }
           python scripts/build.py tools @flags
 
       - name: Chạy test
@@ -165,6 +233,11 @@ jobs:
           $version = "${{ steps.version.outputs.value }}"
           $channel = "${{ steps.version.outputs.channel }}"
           $files = @(Get-ChildItem release -File | Where-Object { $_.Extension -in ".exe", ".zip" } | ForEach-Object { $_.FullName })
+          if (Test-Path release-extra-whisper-vulkan-x64.zip) {
+            # để app tải bản whisper Vulkan (trang Tài nguyên) khi chạy từ mã nguồn / bản cũ
+            Move-Item release-extra-whisper-vulkan-x64.zip whisper-vulkan-x64.zip -Force
+            $files += (Resolve-Path whisper-vulkan-x64.zip).Path
+          }
           if ($channel -eq "nightly") {
             # một release thử nghiệm duy nhất, luôn trỏ tới commit mới nhất của main
             gh release delete nightly --cleanup-tag --yes 2>$null
